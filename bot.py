@@ -1,14 +1,13 @@
 import asyncio
 import os
 from pathlib import Path
+from aiohttp import web
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-
 load_dotenv(Path(__file__).resolve().parent / ".env")
-
 
 GUILD_ID = int(os.getenv("GUILD_ID", "1429125327170441251"))
 
@@ -16,18 +15,44 @@ intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 _commands_synced = False
+_web_server_started = False
+
+
+# --- RUTA PARA LA VERIFICACIÓN / UPTIMEROBOT ---
+async def handle_home(request: web.Request) -> web.Response:
+    return web.Response(text="Servidor de Verificacion Habbo Activo")
 
 
 @bot.event
 async def on_ready() -> None:
-    global _commands_synced
+    global _commands_synced, _web_server_started
+
     print(f"Bot encendido como {bot.user} (ID: {bot.user.id})")
+
+    # --- INICIAR SERVIDOR WEB EN EL PUERTO DE RENDER ---
+    if not _web_server_started:
+        app = web.Application()
+        app.router.add_get("/", handle_home)
+
+        runner = web.AppRunner(app)
+        await runner.setup()
+
+        port = int(os.environ.get("PORT", 8080))
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+
+        _web_server_started = True
+        print(f"Servidor Web escuchando correctamente en el puerto {port}")
+
+    # --- SINCRONIZACIÓN DE COMANDOS DE DISCORD ---
     if _commands_synced:
         return
+
     connected = list(bot.guilds)
     if not connected:
         print("El bot no pertenece a ningún servidor. Debes invitarlo antes de sincronizar comandos.")
         return
+
     selected = bot.get_guild(GUILD_ID)
     if selected is None and len(connected) == 1:
         selected = connected[0]
@@ -37,6 +62,7 @@ async def on_ready() -> None:
         for item in connected:
             print(f"- {item.name}: {item.id}")
         return
+
     guild = discord.Object(id=selected.id)
     try:
         bot.tree.copy_global_to(guild=guild)
