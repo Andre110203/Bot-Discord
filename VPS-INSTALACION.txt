@@ -1,0 +1,28 @@
+ACTUALIZACIÓN DEL BOT EN EL VPS
+
+Esta es la versión que consulta la cola segura de ejercitogfs.gt.tc cada 5 segundos.
+
+1. Conserva una copia de la carpeta actual del bot en el VPS.
+2. Reemplaza bot.py, la carpeta cogs y requirements.txt con los de este paquete.
+3. Conserva la carpeta data si ya existe. No reemplaces verification.sqlite3.
+4. Crea o edita .env en la carpeta del bot con:
+
+DISCORD_TOKEN=TOKEN_REAL_DEL_BOT
+GUILD_ID=1429125327170441251
+LOG_CHANNEL_NAME=registro-verificaciones
+VERIFIED_ROLE_NAME=Verificado
+GFS_WEB_URL=https://ejercitogfs.gt.tc
+BOT_API_SECRET=(copiar el valor de BOT_API_SECRET.txt)
+
+5. Instala o actualiza dependencias:
+
+python3 -m pip install -r requirements.txt
+
+6. Reinicia el servicio del bot.
+
+Al iniciar debe aparecer:
+- Conexión segura con el registro web activada.
+- Módulo cargado: habbo.py
+- Bot encendido como ...
+
+Si aparece "BOT_API_SECRET no configurado", el archivo .env no está en la misma carpeta que bot.py o falta la variable.
