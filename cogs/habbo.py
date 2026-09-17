@@ -18,7 +18,6 @@ from Crypto.Cipher import AES
 from discord import app_commands
 from discord.ext import commands, tasks
 
-
 LOG_CHANNEL_NAME = os.getenv("LOG_CHANNEL_NAME", "registro-verificaciones")
 VERIFIED_ROLE_NAME = os.getenv("VERIFIED_ROLE_NAME", "Verificado")
 CODE_LIFETIME_SECONDS = 10 * 60
@@ -205,9 +204,15 @@ class HabboCommands(commands.Cog):
         self.web_base_url = os.getenv("GFS_WEB_URL", "https://ejercitogfs.gt.tc").rstrip("/")
         self.api_secret = os.getenv("BOT_API_SECRET", "").strip()
         self.web_session = None
+        self.web_runner = None
 
     async def cog_load(self) -> None:
         self.bot.add_view(VerificationView(self))
+        
+        # 1. Iniciar servidor Web HTTP interno en Render para peticiones directas y UptimeRobot
+        await self.start_web_server()
+
+        # 2. Iniciar cliente aiohttp para consultar la cola web de respaldo
         if self.api_secret:
             timeout = aiohttp.ClientTimeout(total=15)
             self.web_session = aiohttp.ClientSession(timeout=timeout, cookie_jar=aiohttp.CookieJar(unsafe=True))
@@ -221,6 +226,23 @@ class HabboCommands(commands.Cog):
             self.registration_queue.cancel()
         if self.web_session and not self.web_session.closed:
             await self.web_session.close()
+        if self.web_runner:
+            await self.web_runner.cleanup()
+
+    async def start_web_server(self) -> None:
+        app = web.Application()
+        app["secret"] = self.api_secret
+        app.router.add_get("/", self.api_health)
+        app.router.add_get("/health", self.api_health)
+        app.router.add_post("/api/challenge/create", self.api_create_challenge)
+        app.router.add_post("/api/challenge/verify", self.api_verify_challenge)
+
+        port = int(os.getenv("PORT", "10000"))
+        self.web_runner = web.AppRunner(app)
+        await self.web_runner.setup()
+        site = web.TCPSite(self.web_runner, "0.0.0.0", port)
+        await site.start()
+        print(f"Servidor Web HTTP activo escuchando en el puerto {port}")
 
     async def web_queue_request(self, payload: dict):
         headers = {
@@ -231,15 +253,11 @@ class HabboCommands(commands.Cog):
         if not self.web_session:
             raise RuntimeError("La sesión web del bot no está iniciada.")
         url = f"{self.web_base_url}/api/bot-registration-queue.php"
-        last_status = 0
-        last_content_type = "desconocido"
         for attempt in range(4):
             request_url = url if attempt == 0 else url + "?i=1"
             try:
                 async with self.web_session.post(request_url, json=payload, headers=headers) as response:
                     body = await response.text()
-                    last_status = response.status
-                    last_content_type = response.headers.get("Content-Type", "desconocido")
                     try:
                         data = json.loads(body)
                     except (TypeError, ValueError):
@@ -253,13 +271,9 @@ class HabboCommands(commands.Cog):
                         if attempt < 3:
                             await asyncio.sleep(0.75 * (attempt + 1))
                             continue
-                        raise RuntimeError(
-                            f"La web no entregó JSON (HTTP {last_status}, {last_content_type})."
-                        )
+                        raise RuntimeError(f"La web no entregó JSON (HTTP {response.status}).")
                     if response.status >= 400:
                         raise RuntimeError(f"La web respondió HTTP {response.status}.")
-                    if not isinstance(data, dict):
-                        raise RuntimeError("La web entregó una respuesta con formato inesperado.")
                     return data
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
                 if attempt >= 3:
@@ -308,7 +322,7 @@ class HabboCommands(commands.Cog):
                 "code_hash": code_hash(code),
             })
         except (aiohttp.ClientError, TimeoutError, RuntimeError, ValueError) as exc:
-            print(f"Error consultando solicitudes web: {exc}")
+            pass  # Evita llenar la consola si la API externa falla intermitentemente
 
     @registration_queue.before_loop
     async def before_registration_queue(self) -> None:
@@ -403,18 +417,25 @@ class HabboCommands(commands.Cog):
 
     def api_authorized(self, request: web.Request) -> bool:
         supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-        return bool(supplied) and hmac.compare_digest(supplied, request.app["secret"])
+        if not supplied:
+            supplied = request.headers.get("X-GFS-Bot-Secret", "").strip()
+        return bool(supplied) and hmac.compare_digest(supplied, self.api_secret)
 
     async def api_health(self, _request: web.Request) -> web.Response:
-        return web.json_response({"ok": True, "service": "gfs-discord-verification"})
+        return web.Response(text="Servidor de Verificacion Habbo Activo", status=200)
 
     async def api_create_challenge(self, request: web.Request) -> web.Response:
         if not self.api_authorized(request):
-            raise web.HTTPUnauthorized()
-        payload = await request.json()
+            return web.json_response({"ok": False, "message": "No autorizado."}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "message": "JSON inválido."}, status=400)
+
         habbo_name = str(payload.get("habbo_name", "")).strip()
         if not habbo_name:
             return web.json_response({"ok": False, "message": "Falta el usuario Habbo."}, status=422)
+        
         link = self.store.linked_habbo(habbo_name)
         if not link:
             return web.json_response({"ok": False, "message": "Este Habbo no está verificado en Discord."}, status=404)
@@ -424,6 +445,7 @@ class HabboCommands(commands.Cog):
             challenge_id = self.store.create_web_challenge(link, code)
         except RuntimeError as exc:
             return web.json_response({"ok": False, "message": str(exc)}, status=429)
+
         try:
             discord_user = await self.bot.fetch_user(int(link["discord_id"]))
             await discord_user.send(
@@ -433,7 +455,7 @@ class HabboCommands(commands.Cog):
         except (discord.Forbidden, discord.NotFound, discord.HTTPException):
             self.store.discard_challenge(challenge_id)
             return web.json_response(
-                {"ok": False, "message": "No pude enviar el mensaje privado. Habilita los mensajes del servidor."},
+                {"ok": False, "message": "No pude enviar el mensaje privado. Habilita los mensajes directos del servidor."},
                 status=409,
             )
         return web.json_response(
@@ -442,8 +464,12 @@ class HabboCommands(commands.Cog):
 
     async def api_verify_challenge(self, request: web.Request) -> web.Response:
         if not self.api_authorized(request):
-            raise web.HTTPUnauthorized()
-        payload = await request.json()
+            return web.json_response({"ok": False, "message": "No autorizado."}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "message": "JSON inválido."}, status=400)
+
         challenge_id = str(payload.get("challenge_id", "")).strip()
         habbo_name = str(payload.get("habbo_name", "")).strip()
         motto = str(payload.get("motto", "")).strip()
