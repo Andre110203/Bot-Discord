@@ -441,11 +441,9 @@ class HabboCommands(commands.Cog):
 
         channel = None
 
-        # 1. Buscar por ID si está configurado en Render
         if LOG_CHANNEL_ID and LOG_CHANNEL_ID.isdigit():
             channel = guild.get_channel(int(LOG_CHANNEL_ID))
 
-        # 2. Buscar por nombre parcial ignorando emojis/corchetes
         if not channel:
             for ch in guild.text_channels:
                 if "registro-verificaciones" in ch.name.lower():
