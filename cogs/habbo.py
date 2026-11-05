@@ -200,9 +200,9 @@ class VerificationStore:
             return dict(row)
 
 
-class VerificationModal(discord.ui.Modal, title="Verificación de Habbo Anti-Alt"):
+class VerificationModal(discord.ui.Modal, title="Registro de Credenciales GFS"):
     usuario = discord.ui.TextInput(
-        label="Nombre de tu Habbo",
+        label="Nombre de tu personaje en Habbo.es",
         placeholder="Ejemplo: Andre_.",
         required=True,
         max_length=32,
@@ -222,10 +222,10 @@ class VerificationView(discord.ui.View):
         self.cog = cog
 
     @discord.ui.button(
-        label="Verificar mi Habbo",
+        label="Iniciar Registro Militar",
         style=discord.ButtonStyle.green,
         custom_id="btn_verificar_habbo",
-        emoji="🔐",
+        emoji="🎖️",
     )
     async def verify_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         await interaction.response.send_modal(VerificationModal(self.cog))
@@ -245,7 +245,6 @@ class HabboCommands(commands.Cog):
 
     async def cog_load(self) -> None:
         self.bot.add_view(VerificationView(self))
-        
         await self.start_web_server()
 
         if self.api_secret:
@@ -265,7 +264,7 @@ class HabboCommands(commands.Cog):
             await self.web_runner.cleanup()
 
     async def api_health(self, _request: web.Request) -> web.Response:
-        return web.Response(text="Servidor de Verificación Habbo Activo", status=200)
+        return web.Response(text="Servidor de Verificación Militar Activo", status=200)
 
     def api_authorized(self, request: web.Request) -> bool:
         supplied = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
@@ -294,7 +293,7 @@ class HabboCommands(commands.Cog):
     async def handle_verify_page(self, request: web.Request) -> web.Response:
         token = request.query.get("token")
         if not token or token not in self.pending_web_tokens:
-            return web.Response(text="<h1>❌ Token de verificación inválido o expirado.</h1>", content_type="text/html", status=400)
+            return web.Response(text="<h1>❌ Enlace de validación inválido o expirado.</h1>", content_type="text/html", status=400)
 
         data = self.pending_web_tokens[token]
         habbo_name = data["habbo_name"]
@@ -305,12 +304,12 @@ class HabboCommands(commands.Cog):
         <head>
             <meta charset="UTF-8">
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Verificación Anti-Alt GFS</title>
+            <title>Centro de Identificación Militar GFS</title>
             <style>
                 body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e2e; color: #fff; text-align: center; padding: 40px 10px; }}
-                .card {{ background: #2b2b3d; padding: 30px; border-radius: 12px; display: inline-block; max-width: 420px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }}
-                h2 {{ color: #5865F2; margin-bottom: 10px; }}
-                button {{ background: #43b581; color: white; border: none; padding: 14px 24px; font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; transition: background 0.2s; }}
+                .card {{ background: #2b2b3d; padding: 30px; border-radius: 12px; display: inline-block; max-width: 440px; box-shadow: 0 4px 15px rgba(0,0,0,0.4); border: 1px solid #3f3f5a; }}
+                h2 {{ color: #5865F2; margin-bottom: 10px; letter-spacing: 0.5px; }}
+                button {{ background: #43b581; color: white; border: none; padding: 14px 26px; font-size: 16px; font-weight: bold; border-radius: 6px; cursor: pointer; transition: background 0.2s; width: 100%; margin-top: 15px; }}
                 button:hover {{ background: #3ca374; }}
                 #status {{ margin-top: 20px; font-size: 15px; font-weight: bold; word-break: break-word; }}
             </style>
@@ -318,11 +317,10 @@ class HabboCommands(commands.Cog):
         </head>
         <body>
             <div class="card">
-                <h2>🛡️ Verificación Militar GFS</h2>
-                <p>Usuario a validar: <strong>{habbo_name}</strong></p>
-                <p style="font-size: 13px; color: #b9bbbe;">Se escaneará tu dispositivo e IP para prevenir multicuentas en el ejército.</p>
-                <br>
-                <button id="btn-verify" onclick="processVerification()">Validar Mi Dispositivo</button>
+                <h2>🎖️ Centro de Identificación GFS</h2>
+                <p>Oficial a validar: <strong>{habbo_name}</strong></p>
+                <p style="font-size: 13px; color: #b9bbbe; line-height: 1.4;">Se procederá con la autenticación de seguridad militar y verificación de terminal de acceso.</p>
+                <button id="btn-verify" onclick="processVerification()">Confirmar Identidad Militar</button>
                 <div id="status"></div>
             </div>
 
@@ -332,14 +330,14 @@ class HabboCommands(commands.Cog):
                     const btn = document.getElementById("btn-verify");
                     btn.disabled = true;
                     statusDiv.style.color = "#ffffff";
-                    statusDiv.innerHTML = "⏳ Generando huella digital...";
+                    statusDiv.innerHTML = "⏳ Validando credenciales de acceso...";
 
                     try {{
                         const fp = await FingerprintJS.load();
                         const result = await fp.get();
                         const visitorId = result.visitorId;
 
-                        statusDiv.innerHTML = "⏳ Comprobando con el servidor...";
+                        statusDiv.innerHTML = "⏳ Verificando registros en la base militar...";
 
                         const response = await fetch("/api/confirm", {{
                             method: "POST",
@@ -384,10 +382,10 @@ class HabboCommands(commands.Cog):
         client_ip = request.headers.get("x-forwarded-for", peername[0] if peername else "0.0.0.0").split(",")[0].strip()
 
         if not token or token not in self.pending_web_tokens:
-            return web.json_response({"error": "El token de verificación ha expirado o no existe."}, status=400)
+            return web.json_response({"error": "El token de validación ha expirado o no existe."}, status=400)
 
         if not fingerprint:
-            return web.json_response({"error": "No se pudo obtener la huella digital del dispositivo."}, status=400)
+            return web.json_response({"error": "No se pudo obtener la firma de seguridad de la terminal."}, status=400)
 
         token_data = self.pending_web_tokens[token]
         discord_id = token_data["discord_id"]
@@ -397,12 +395,12 @@ class HabboCommands(commands.Cog):
         alt_found = self.store.is_device_registered(fingerprint, client_ip, discord_id)
         if alt_found:
             return web.json_response({
-                "error": "Se detectó que este dispositivo o red IP ya fue usado por otra cuenta militar."
+                "error": "Acceso denegado: Esta terminal o red ya fue registrada por otra cuenta en el sistema militar."
             }, status=403)
 
         habbo_data = await self.fetch_habbo_user(habbo_name)
         if not habbo_data:
-            return web.json_response({"error": f"La cuenta de Habbo '{habbo_name}' no existe."}, status=404)
+            return web.json_response({"error": f"La cuenta de Habbo '{habbo_name}' no existe en el sistema oficial."}, status=404)
 
         self.store.save_link(discord_id, guild_id, habbo_data)
         self.store.save_device_log(discord_id, habbo_data.get("uniqueId", ""), fingerprint, client_ip)
@@ -433,7 +431,7 @@ class HabboCommands(commands.Cog):
 
         self.bot.loop.create_task(self.send_web_verification_log(guild_id, discord_id, habbo_data, client_ip, fingerprint))
 
-        return web.json_response({"message": "¡Verificación de dispositivo completada con éxito! Ya puedes volver a Discord."})
+        return web.json_response({"message": "¡Verificación de credenciales completada con éxito! Ya puedes volver a Discord."})
 
     async def send_web_verification_log(self, guild_id: int, discord_id: int, data: dict, ip_address: str, fingerprint: str) -> None:
         guild = self.bot.get_guild(guild_id)
@@ -446,17 +444,17 @@ class HabboCommands(commands.Cog):
 
         figure = data.get("figureString", "")
         embed = discord.Embed(
-            title="🛡️ Nueva Verificación Anti-Alt Completada",
-            description=f"El recluta <@{discord_id}> ha validado su dispositivo correctamente.",
-            color=discord.Color.green()
+            title="📋 Nueva Identificación Militar Registrada",
+            description=f"El oficial <@{discord_id}> ha autenticado sus credenciales correctamente.",
+            color=discord.Color.blue()
         )
         embed.add_field(name="Usuario Discord", value=f"<@{discord_id}> (`{discord_id}`)", inline=False)
         embed.add_field(name="Habbo Registrado", value=f"**{data['name']}**", inline=True)
-        embed.add_field(name="ID Habbo", value=f"`{data.get('uniqueId', 'N/A')}`", inline=True)
-        embed.add_field(name="IP capturada", value=f"`{ip_address}`", inline=True)
-        embed.add_field(name="Fingerprint ID", value=f"`{fingerprint[:12]}...`", inline=True)
+        embed.add_field(name="ID Oficial", value=f"`{data.get('uniqueId', 'N/A')}`", inline=True)
+        embed.add_field(name="Terminal IP", value=f"`{ip_address}`", inline=True)
+        embed.add_field(name="Firma Digital", value=f"`{fingerprint[:12]}...`", inline=True)
         embed.set_thumbnail(url=f"{IMAGING_URL}?figure={figure}&direction=2&head_direction=3&gesture=sml&size=l")
-        embed.set_footer(text="Ejército GFS · Sistema Anti-Alt Render")
+        embed.set_footer(text="Ejército GFS · Sistema Oficial de Identificación")
 
         try:
             await channel.send(embed=embed)
@@ -566,7 +564,7 @@ class HabboCommands(commands.Cog):
         link = self.store.linked_discord(discord_id)
         if link:
             return await interaction.followup.send(
-                f"❌ Tu Discord ya está vinculado a la cuenta de Habbo **.", ephemeral=True
+                f"❌ Tu usuario ya se encuentra registrado con la credencial de Habbo **.", ephemeral=True
             )
 
         token = str(uuid.uuid4())
@@ -579,14 +577,14 @@ class HabboCommands(commands.Cog):
         verify_url = f"{self.external_render_url}/verify?token={token}"
 
         embed = discord.Embed(
-            title="🛡️ Verificación Anti-Alt GFS",
+            title="🎖️ Autenticación de Credenciales GFS",
             description=(
-                f"Hola **{interaction.user.display_name}**, para vincular tu usuario **{habbo_name}**:\n\n"
-                f"1. Abre el enlace de verificación abajo.\n"
-                f"2. Presiona el botón para validar tu dispositivo/IP.\n\n"
-                f"🔗 [Haz clic aquí para verificar tu dispositivo]({verify_url})"
+                f"Bienvenido **{interaction.user.display_name}**. Para vincular la cuenta **{habbo_name}**:\n\n"
+                f"1. Accede al enlace oficial de validación militar abajo.\n"
+                f"2. Presiona el botón para autenticar tu terminal de acceso.\n\n"
+                f"🔗 [Haz clic aquí para validar tus credenciales]({verify_url})"
             ),
-            color=discord.Color.green(),
+            color=discord.Color.blue(),
         )
         await interaction.followup.send(embed=embed, ephemeral=True)
 
@@ -679,11 +677,11 @@ class HabboCommands(commands.Cog):
         embed.set_image(url=f"{IMAGING_URL}?figure={data.get('figureString','')}&direction=2&head_direction=2&gesture=sml&size=l")
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="verificar_web", description="Verificación por enlace con escaneo anti-alt.")
+    @app_commands.command(name="verificar_web", description="Verificación oficial de credenciales militares.")
     async def verificar_web(self, interaction: discord.Interaction, habbo_name: str) -> None:
         await self.start_web_verification_flow(interaction, habbo_name)
 
-    @app_commands.command(name="check_logs", description="Muestra las IPs y Fingerprints registrados en SQLite (Solo Admins).")
+    @app_commands.command(name="check_logs", description="Consulta la base militar de identidades (Solo Admins).")
     @app_commands.checks.has_permissions(administrator=True)
     async def check_logs(self, interaction: discord.Interaction, usuario_discord: discord.User = None) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -695,10 +693,10 @@ class HabboCommands(commands.Cog):
             logs = db.execute("SELECT * FROM device_logs WHERE discord_id=? ORDER BY id DESC LIMIT 5", (target_id,)).fetchall()
 
         if not link and not logs:
-            return await interaction.followup.send(f"❌ No hay datos en SQLite para {target_user.mention}.", ephemeral=True)
+            return await interaction.followup.send(f"❌ No hay registros en la base militar para {target_user.mention}.", ephemeral=True)
 
         embed = discord.Embed(
-            title=f"🔎 Registros Anti-Alt - {target_user.display_name}",
+            title=f"🔎 Registros de Identificación - {target_user.display_name}",
             color=discord.Color.blue()
         )
 
@@ -708,23 +706,29 @@ class HabboCommands(commands.Cog):
         if logs:
             history = ""
             for log in logs:
-                history += f"• **IP:** `{log['ip_address']}` | **Fingerprint:** `{log['fingerprint'][:12]}...`\n"
-            embed.add_field(name="Historial de Dispositivos", value=history, inline=False)
+                history += f"• **IP:** `{log['ip_address']}` | **Firma:** `{log['fingerprint'][:12]}...`\n"
+            embed.add_field(name="Historial de Terminales", value=history, inline=False)
         else:
-            embed.add_field(name="Historial de Dispositivos", value="⚠️ No hay registros en `device_logs`.", inline=False)
+            embed.add_field(name="Historial de Terminales", value="⚠️ Sin registros de terminal registrados.", inline=False)
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    @app_commands.command(name="panel_verificacion", description="Publica el panel de verificación.")
+    @app_commands.command(name="panel_verificacion", description="Publica el panel oficial de identificación militar.")
     @app_commands.checks.has_permissions(administrator=True)
     async def panel_verificacion(self, interaction: discord.Interaction) -> None:
         embed = discord.Embed(
-            title="🛡️ Sistema de Verificación Anti-Alt GFS",
-            description="Haz clic en el botón de abajo para iniciar la verificación de tu usuario y validar tu dispositivo.",
+            title="🛡️ Control de Identidad Militar GFS",
+            description=(
+                "Presiona el botón de abajo para iniciar la vinculación oficial de tu cuenta de Habbo.es con la base del ejército.\n\n"
+                "• Se actualizará tu apodo con tu nombre oficial de tropa.\n"
+                "• Recibirás acceso directo a las instalaciones de Discord.\n"
+                "• Se asignarán tus rangos de inicio correspondientes."
+            ),
             color=discord.Color.blue(),
         )
+        embed.set_footer(text="Ejército GFS · Sistema Oficial de Verificación")
         await interaction.channel.send(embed=embed, view=VerificationView(self))
-        await interaction.response.send_message("✅ Panel publicado.", ephemeral=True)
+        await interaction.response.send_message("✅ Panel militar publicado con éxito.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
