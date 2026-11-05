@@ -441,11 +441,11 @@ class HabboCommands(commands.Cog):
 
         channel = None
 
-        # 1. Buscar por ID si existe variable de entorno LOG_CHANNEL_ID
-        if LOG_CHANNEL_ID.isdigit():
+        # 1. Buscar por ID si está configurado en Render
+        if LOG_CHANNEL_ID and LOG_CHANNEL_ID.isdigit():
             channel = guild.get_channel(int(LOG_CHANNEL_ID))
 
-        # 2. Buscar canal por coincidencia parcial de nombre (ignora emojis/corchetes como "[☑️] registro-verificaciones")
+        # 2. Buscar por nombre parcial ignorando emojis/corchetes
         if not channel:
             for ch in guild.text_channels:
                 if "registro-verificaciones" in ch.name.lower():
@@ -453,7 +453,7 @@ class HabboCommands(commands.Cog):
                     break
 
         if not channel:
-            print(f"[ALERTA LOGS] No se encontró ningún canal de registro de verificaciones en la guild {guild_id}.", flush=True)
+            print(f"[ALERTA LOGS] No se encontró el canal de registros en la guild {guild_id}.", flush=True)
             return
 
         figure = data.get("figureString", "")
@@ -473,7 +473,7 @@ class HabboCommands(commands.Cog):
         try:
             await channel.send(embed=embed)
         except Exception as e:
-            print(f"No se pudo enviar el log a Discord: {e}", flush=True)
+            print(f"Error al enviar el mensaje al canal {channel.name}: {e}", flush=True)
 
     async def web_queue_request(self, payload: dict):
         headers = {
@@ -660,4 +660,97 @@ class HabboCommands(commands.Cog):
             {
                 "ok": True,
                 "discord_id": str(verified["discord_id"]),
-                "habbo_name": verified["habbo
+                "habbo_name": verified["habbo_name"],
+                "habbo_unique_id": verified["habbo_unique_id"],
+            }
+        )
+
+    @app_commands.command(name="sync", description="Fuerza la sincronización de comandos Slash en el servidor (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def sync_commands(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        synced = await self.bot.tree.sync(guild=interaction.guild)
+        await interaction.followup.send(f"✅ Se sincronizaron **{len(synced)}** comandos Slash en este servidor.", ephemeral=True)
+
+    @app_commands.command(name="perfil", description="Muestra el perfil público de un usuario de Habbo.")
+    async def perfil(self, interaction: discord.Interaction, usuario: str) -> None:
+        await interaction.response.defer()
+        data = await self.fetch_habbo_user(usuario)
+        if not data:
+            await interaction.followup.send("❌ Usuario no encontrado.", ephemeral=True)
+            return
+        online = "🟢 En línea" if data.get("online") else "🔴 Desconectado"
+        embed = discord.Embed(title=f"Perfil de Habbo: {data['name']}", color=discord.Color.gold())
+        embed.add_field(name="Misión", value=data.get("motto") or "Sin misión", inline=False)
+        embed.add_field(name="Estado", value=online)
+        embed.add_field(name="Miembro desde", value=str(data.get("memberSince", "Desconocido")).split("T")[0])
+        embed.set_thumbnail(url=f"{IMAGING_URL}?figure={data.get('figureString','')}&size=l")
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="avatar", description="Obtiene la imagen del avatar de Habbo.")
+    async def avatar(self, interaction: discord.Interaction, usuario: str) -> None:
+        await interaction.response.defer()
+        data = await self.fetch_habbo_user(usuario)
+        if not data:
+            await interaction.followup.send("❌ Usuario no encontrado.", ephemeral=True)
+            return
+        embed = discord.Embed(title=f"Avatar de {data['name']}", color=discord.Color.blue())
+        embed.set_image(url=f"{IMAGING_URL}?figure={data.get('figureString','')}&direction=2&head_direction=2&gesture=sml&size=l")
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="verificar_web", description="Verificación oficial de credenciales militares.")
+    async def verificar_web(self, interaction: discord.Interaction, habbo_name: str) -> None:
+        await self.start_web_verification_flow(interaction, habbo_name)
+
+    @app_commands.command(name="check_logs", description="Consulta la base militar de identidades (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def check_logs(self, interaction: discord.Interaction, usuario_discord: discord.User = None) -> None:
+        await interaction.response.defer(ephemeral=True)
+        target_user = usuario_discord or interaction.user
+        target_id = target_user.id
+
+        with self.store.database() as db:
+            link = db.execute("SELECT * FROM verified_links WHERE discord_id=?", (target_id,)).fetchone()
+            logs = db.execute("SELECT * FROM device_logs WHERE discord_id=? ORDER BY id DESC LIMIT 5", (target_id,)).fetchall()
+
+        if not link and not logs:
+            return await interaction.followup.send(f"❌ No hay registros en la base militar para {target_user.mention}.", ephemeral=True)
+
+        embed = discord.Embed(
+            title=f"🔎 Registros de Identificación - {target_user.display_name}",
+            color=discord.Color.blue()
+        )
+
+        if link:
+            embed.add_field(name="Habbo Vinculado", value=f"**{link['habbo_name']}** (`{link['habbo_unique_id']}`)", inline=False)
+
+        if logs:
+            history = ""
+            for log in logs:
+                history += f"• **IP:** `{log['ip_address']}` | **Firma:** `{log['fingerprint'][:12]}...`\n"
+            embed.add_field(name="Historial de Terminales", value=history, inline=False)
+        else:
+            embed.add_field(name="Historial de Terminales", value="⚠️ Sin registros de terminal registrados.", inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="panel_verificacion", description="Publica el panel oficial de identificación militar.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def panel_verificacion(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title="🛡️ Control de Identidad Militar GFS",
+            description=(
+                "Presiona el botón de abajo para iniciar la vinculación oficial de tu cuenta de Habbo.es con la base del ejército.\n\n"
+                "• Se actualizará tu apodo con tu nombre oficial de tropa.\n"
+                "• Recibirás acceso directo a las instalaciones de Discord.\n"
+                "• Se asignarán tus rangos de inicio correspondientes."
+            ),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text="Ejército GFS · Sistema Oficial de Verificación")
+        await interaction.channel.send(embed=embed, view=VerificationView(self))
+        await interaction.response.send_message("✅ Panel militar publicado con éxito.", ephemeral=True)
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(HabboCommands(bot))
