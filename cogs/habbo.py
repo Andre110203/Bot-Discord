@@ -455,4 +455,277 @@ class HabboCommands(commands.Cog):
         embed.add_field(name="ID Habbo", value=f"`{data.get('uniqueId', 'N/A')}`", inline=True)
         embed.add_field(name="IP capturada", value=f"`{ip_address}`", inline=True)
         embed.add_field(name="Fingerprint ID", value=f"`{fingerprint[:12]}...`", inline=True)
-        embed.set_thumbnail(url=f"{IMAGING_URL}?figure={figure}&direction=2&head_direction=3&
+        embed.set_thumbnail(url=f"{IMAGING_URL}?figure={figure}&direction=2&head_direction=3&gesture=sml&size=l")
+        embed.set_footer(text="Ejército GFS · Sistema Anti-Alt Render")
+
+        try:
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"No se pudo enviar el log a Discord: {e}", flush=True)
+
+    async def web_queue_request(self, payload: dict):
+        headers = {
+            "Authorization": f"Bearer {self.api_secret}",
+            "X-GFS-Bot-Secret": self.api_secret,
+            "Accept": "application/json",
+        }
+        if not self.web_session:
+            raise RuntimeError("La sesión web del bot no está iniciada.")
+        url = f"{self.web_base_url}/api/bot-registration-queue.php"
+        for attempt in range(4):
+            request_url = url if attempt == 0 else url + "?i=1"
+            try:
+                async with self.web_session.post(request_url, json=payload, headers=headers) as response:
+                    body = await response.text()
+                    try:
+                        data = json.loads(body)
+                    except (TypeError, ValueError):
+                        values = re.findall(r'toNumbers\("([0-9a-f]+)"\)', body)
+                        if len(values) >= 3:
+                            key, iv, encrypted = (bytes.fromhex(value) for value in values[:3])
+                            cookie = AES.new(key, AES.MODE_CBC, iv).decrypt(encrypted).hex()
+                            self.web_session.cookie_jar.update_cookies({"__test": cookie}, response.url)
+                            await asyncio.sleep(0.35)
+                            continue
+                        if attempt < 3:
+                            await asyncio.sleep(0.75 * (attempt + 1))
+                            continue
+                        raise RuntimeError(f"La web no entregó JSON (HTTP {response.status}).")
+                    if response.status >= 400:
+                        raise RuntimeError(f"La web respondió HTTP {response.status}.")
+                    return data
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                if attempt >= 3:
+                    raise RuntimeError(f"No fue posible conectar con la web: {exc}") from exc
+                await asyncio.sleep(0.75 * (attempt + 1))
+        raise RuntimeError("No fue posible superar la validación del alojamiento web.")
+
+    @tasks.loop(seconds=5)
+    async def registration_queue(self) -> None:
+        try:
+            response = await self.web_queue_request({"action": "pull"})
+            request = response.get("request") if isinstance(response, dict) else None
+            if not request:
+                return
+            request_id = int(request["id"])
+            request_token = str(request["solicitud_token"])
+            habbo_name = str(request["habbo_nombre"])
+            link = self.store.linked_habbo(habbo_name)
+            if not link:
+                await self.web_queue_request({
+                    "action": "failed", "id": request_id, "request_token": request_token,
+                    "message": "Este Habbo todavía no está vinculado con un Discord verificado.",
+                })
+                return
+            code = new_code("GFS-WEB")
+            try:
+                discord_user = await self.bot.fetch_user(int(link["discord_id"]))
+                await discord_user.send(
+                    "🔐 **Registro web GFS**\n\n"
+                    f"Coloca este código exactamente en tu misión de Habbo:\n`{code}`\n\n"
+                    "Vuelve a la web y presiona **Verificar misión. Caduca en 10 minutos."
+                )
+            except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+                await self.web_queue_request({
+                    "action": "failed", "id": request_id, "request_token": request_token,
+                    "message": "No pude enviarte el mensaje privado. Habilita los mensajes directos del servidor.",
+                })
+                return
+            await self.web_queue_request({
+                "action": "delivered",
+                "id": request_id,
+                "request_token": request_token,
+                "discord_id": str(link["discord_id"]),
+                "habbo_unique_id": link["habbo_unique_id"],
+                "habbo_name": link["habbo_name"],
+                "code_hash": code_hash(code),
+            })
+        except (aiohttp.ClientError, TimeoutError, RuntimeError, ValueError):
+            pass
+
+    @registration_queue.before_loop
+    async def before_registration_queue(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def fetch_habbo_user(self, username: str):
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(f"{BASE_URL}/users", params={"name": username.strip()}) as response:
+                    if response.status == 200:
+                        return await response.json()
+        except (aiohttp.ClientError, TimeoutError):
+            return None
+        return None
+
+    async def start_web_verification_flow(self, interaction: discord.Interaction, habbo_name: str) -> None:
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
+
+        discord_id = interaction.user.id
+        link = self.store.linked_discord(discord_id)
+        if link:
+            return await interaction.followup.send(
+                f"❌ Tu Discord ya está vinculado a la cuenta de Habbo **.", ephemeral=True
+            )
+
+        token = str(uuid.uuid4())
+        self.pending_web_tokens[token] = {
+            "discord_id": discord_id,
+            "habbo_name": habbo_name,
+            "guild_id": interaction.guild_id or 0
+        }
+
+        verify_url = f"{self.external_render_url}/verify?token={token}"
+
+        embed = discord.Embed(
+            title="🛡️ Verificación Anti-Alt GFS",
+            description=(
+                f"Hola **{interaction.user.display_name}**, para vincular tu usuario **{habbo_name}**:\n\n"
+                f"1. Abre el enlace de verificación abajo.\n"
+                f"2. Presiona el botón para validar tu dispositivo/IP.\n\n"
+                f"🔗 [Haz clic aquí para verificar tu dispositivo]({verify_url})"
+            ),
+            color=discord.Color.green(),
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def api_create_challenge(self, request: web.Request) -> web.Response:
+        if not self.api_authorized(request):
+            return web.json_response({"ok": False, "message": "No autorizado."}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "message": "JSON inválido."}, status=400)
+
+        habbo_name = str(payload.get("habbo_name", "")).strip()
+        if not habbo_name:
+            return web.json_response({"ok": False, "message": "Falta el usuario Habbo."}, status=422)
+        
+        link = self.store.linked_habbo(habbo_name)
+        if not link:
+            return web.json_response({"ok": False, "message": "Este Habbo no está verificado en Discord."}, status=404)
+
+        code = new_code("GFS-WEB")
+        try:
+            challenge_id = self.store.create_web_challenge(link, code)
+        except RuntimeError as exc:
+            return web.json_response({"ok": False, "message": str(exc)}, status=429)
+
+        try:
+            discord_user = await self.bot.fetch_user(int(link["discord_id"]))
+            await discord_user.send(
+                f"🔐 **Registro web GFS**\n\nColoca este código exactamente en tu misión de Habbo:\n"
+                f"`{code}`\n\nCaduca en 10 minutos y solo puede utilizarse una vez."
+            )
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            self.store.discard_challenge(challenge_id)
+            return web.json_response(
+                {"ok": False, "message": "No pude enviar el mensaje privado. Habilita los mensajes directos del servidor."},
+                status=409,
+            )
+        return web.json_response(
+            {"ok": True, "challenge_id": challenge_id, "expires_in": CODE_LIFETIME_SECONDS}
+        )
+
+    async def api_verify_challenge(self, request: web.Request) -> web.Response:
+        if not self.api_authorized(request):
+            return web.json_response({"ok": False, "message": "No autorizado."}, status=401)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "message": "JSON inválido."}, status=400)
+
+        challenge_id = str(payload.get("challenge_id", "")).strip()
+        habbo_name = str(payload.get("habbo_name", "")).strip()
+        motto = str(payload.get("motto", "")).strip()
+        verified = self.store.consume_web_challenge(challenge_id, habbo_name, motto)
+        if not verified:
+            return web.json_response(
+                {"ok": False, "message": "Código incorrecto, vencido o ya utilizado."}, status=422
+            )
+        return web.json_response(
+            {
+                "ok": True,
+                "discord_id": str(verified["discord_id"]),
+                "habbo_name": verified["habbo_name"],
+                "habbo_unique_id": verified["habbo_unique_id"],
+            }
+        )
+
+    @app_commands.command(name="perfil", description="Muestra el perfil público de un usuario de Habbo.")
+    async def perfil(self, interaction: discord.Interaction, usuario: str) -> None:
+        await interaction.response.defer()
+        data = await self.fetch_habbo_user(usuario)
+        if not data:
+            await interaction.followup.send("❌ Usuario no encontrado.", ephemeral=True)
+            return
+        online = "🟢 En línea" if data.get("online") else "🔴 Desconectado"
+        embed = discord.Embed(title=f"Perfil de Habbo: {data['name']}", color=discord.Color.gold())
+        embed.add_field(name="Misión", value=data.get("motto") or "Sin misión", inline=False)
+        embed.add_field(name="Estado", value=online)
+        embed.add_field(name="Miembro desde", value=str(data.get("memberSince", "Desconocido")).split("T")[0])
+        embed.set_thumbnail(url=f"{IMAGING_URL}?figure={data.get('figureString','')}&size=l")
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="avatar", description="Obtiene la imagen del avatar de Habbo.")
+    async def avatar(self, interaction: discord.Interaction, usuario: str) -> None:
+        await interaction.response.defer()
+        data = await self.fetch_habbo_user(usuario)
+        if not data:
+            await interaction.followup.send("❌ Usuario no encontrado.", ephemeral=True)
+            return
+        embed = discord.Embed(title=f"Avatar de {data['name']}", color=discord.Color.blue())
+        embed.set_image(url=f"{IMAGING_URL}?figure={data.get('figureString','')}&direction=2&head_direction=2&gesture=sml&size=l")
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="verificar_web", description="Verificación por enlace con escaneo anti-alt.")
+    async def verificar_web(self, interaction: discord.Interaction, habbo_name: str) -> None:
+        await self.start_web_verification_flow(interaction, habbo_name)
+
+    @app_commands.command(name="check_logs", description="Muestra las IPs y Fingerprints registrados en SQLite (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def check_logs(self, interaction: discord.Interaction, usuario_discord: discord.User = None) -> None:
+        await interaction.response.defer(ephemeral=True)
+        target_user = usuario_discord or interaction.user
+        target_id = target_user.id
+
+        with self.store.database() as db:
+            link = db.execute("SELECT * FROM verified_links WHERE discord_id=?", (target_id,)).fetchone()
+            logs = db.execute("SELECT * FROM device_logs WHERE discord_id=? ORDER BY id DESC LIMIT 5", (target_id,)).fetchall()
+
+        if not link and not logs:
+            return await interaction.followup.send(f"❌ No hay datos en SQLite para {target_user.mention}.", ephemeral=True)
+
+        embed = discord.Embed(
+            title=f"🔎 Registros Anti-Alt - {target_user.display_name}",
+            color=discord.Color.blue()
+        )
+
+        if link:
+            embed.add_field(name="Habbo Vinculado", value=f"**{link['habbo_name']}** (`{link['habbo_unique_id']}`)", inline=False)
+
+        if logs:
+            history = ""
+            for log in logs:
+                history += f"• **IP:** `{log['ip_address']}` | **Fingerprint:** `{log['fingerprint'][:12]}...`\n"
+            embed.add_field(name="Historial de Dispositivos", value=history, inline=False)
+        else:
+            embed.add_field(name="Historial de Dispositivos", value="⚠️ No hay registros en `device_logs`.", inline=False)
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="panel_verificacion", description="Publica el panel de verificación.")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def panel_verificacion(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title="🛡️ Sistema de Verificación Anti-Alt GFS",
+            description="Haz clic en el botón de abajo para iniciar la verificación de tu usuario y validar tu dispositivo.",
+            color=discord.Color.blue(),
+        )
+        await interaction.channel.send(embed=embed, view=VerificationView(self))
+        await interaction.response.send_message("✅ Panel publicado.", ephemeral=True)
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(HabboCommands(bot))
