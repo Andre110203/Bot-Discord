@@ -16,6 +16,7 @@ GUILD_ID = int(os.getenv("GUILD_ID", "1429125327170441251"))
 
 intents = discord.Intents.default()
 intents.members = True
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 _commands_synced = False
 
