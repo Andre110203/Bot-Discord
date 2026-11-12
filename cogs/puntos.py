@@ -120,14 +120,11 @@ class PointsStore:
             if exists:
                 return
 
-            # Sumar puntos al Guía (+5)
             self._upsert_points(db, guide["discord_id"], guide["habbo_name"], guide_pts=POINTS_GUIDE, now=now)
 
-            # Sumar puntos a Participantes (+1 c/u)
             for p in participants:
                 self._upsert_points(db, p["discord_id"], p["habbo_name"], part_pts=POINTS_PARTICIPANT, now=now)
 
-            # Sumar puntos a Ganadores de ronda (+3 por ronda)
             for w in winners:
                 self._upsert_points(db, w["discord_id"], w["habbo_name"], win_pts=POINTS_WINNER, now=now)
 
@@ -374,12 +371,10 @@ class PointsCommands(commands.Cog):
 
         unverified = []
 
-        # 1. Validar Encargado
         guide_row = self.store.get_verified_user(parsed["guide"])
         if not guide_row:
             unverified.append(f"Encargado(a): `{parsed['guide']}`")
 
-        # 2. Validar Participantes (evitar duplicados en la misma lista de participación)
         seen_part = set()
         valid_participants = []
         for p_name in parsed["participants"]:
@@ -393,7 +388,6 @@ class PointsCommands(commands.Cog):
             else:
                 valid_participants.append(dict(row))
 
-        # 3. Validar Ganadores por ronda (permite ganar múltiples rondas)
         valid_winners = []
         for w_name in parsed["winners"]:
             row = self.store.get_verified_user(w_name)
@@ -418,7 +412,6 @@ class PointsCommands(commands.Cog):
             )
             return
 
-        # Registrar puntos en SQLite
         summary = f"Guía: {guide_row['habbo_name']} | Part: {len(valid_participants)} | Rondas: {len(valid_winners)}"
         self.store.record_activity(
             message_id=message.id,
@@ -513,11 +506,12 @@ class PointsCommands(commands.Cog):
 
         link = self.store.get_verified_user(habbo_usuario)
         if not link:
-            return await interaction.followup.send(f"❌ El usuario **{habbo_usuario} no está verificado.", ephemeral=True)
+            return await interaction.followup.send(f"❌ El usuario **{habbo_usuario}** no está verificado.", ephemeral=True)
 
+        habbo_oficial = link["habbo_name"]
         success = self.store.redeem_membership(
             discord_id=int(link["discord_id"]),
-            habbo_name=link["habbo_name"],
+            habbo_name=habbo_oficial,
             membership_name=membresia,
             cost=costo_puntos,
             admin_id=interaction.user.id,
@@ -526,7 +520,7 @@ class PointsCommands(commands.Cog):
             bal = self.store.get_user_balance(int(link["discord_id"]))
             disp = bal["available"] if bal else 0
             return await interaction.followup.send(
-                f"❌ ** no tiene saldo suficiente. Disponible actual: **{disp} pts.",
+                f"❌ **{habbo_oficial}** no tiene saldo suficiente. Disponible actual: **{disp} pts**.",
                 ephemeral=True,
             )
 
@@ -536,7 +530,7 @@ class PointsCommands(commands.Cog):
             description=f"Se ha procesado el canje de puntos de <@{link['discord_id']}>.",
             color=discord.Color.green(),
         )
-        embed.add_field(name="Oficial", value=f"**", inline=True)
+        embed.add_field(name="Oficial", value=f"**{habbo_oficial}**", inline=True)
         embed.add_field(name="Membresía Adquirida", value=f"**{membresia}**", inline=True)
         embed.add_field(name="Costo Descontado", value=f"`-{costo_puntos} pts`", inline=True)
         embed.add_field(name="Saldo Restante", value=f"**{bal['available']} pts**", inline=True)
@@ -552,14 +546,15 @@ class PointsCommands(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         link = self.store.get_verified_user(habbo_usuario)
         if not link:
-            return await interaction.followup.send(f"❌ El usuario **{habbo_usuario} no está verificado.", ephemeral=True)
+            return await interaction.followup.send(f"❌ El usuario **{habbo_usuario}** no está verificado.", ephemeral=True)
 
-        self.store.adjust_points(int(link["discord_id"]), link["habbo_name"], puntos)
+        habbo_oficial = link["habbo_name"]
+        self.store.adjust_points(int(link["discord_id"]), habbo_oficial, puntos)
         bal = self.store.get_user_balance(int(link["discord_id"]))
         await self.refresh_live_board(interaction.guild)
         signo = "+" if puntos >= 0 else ""
         await interaction.followup.send(
-            f"✅ Ajuste aplicado a ** (`{signo}{puntos} pts`). Nuevo saldo disponible: **{bal['available']} pts**.\n**Motivo:** {motivo}",
+            f"✅ Ajuste aplicado a **{habbo_oficial}** (`{signo}{puntos} pts`). Nuevo saldo disponible: **{bal['available']} pts**.\n**Motivo:** {motivo}",
             ephemeral=True,
         )
 
