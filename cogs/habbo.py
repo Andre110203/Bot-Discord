@@ -21,6 +21,9 @@ from discord.ext import commands, tasks
 
 LOG_CHANNEL_NAME = os.getenv("LOG_CHANNEL_NAME", "registro-verificaciones")
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID", "").strip()
+ALERT_CHANNEL_NAME = os.getenv("ALERT_CHANNEL_NAME", "alertas-seguridad")
+ALERT_CHANNEL_ID = os.getenv("ALERT_CHANNEL_ID", "").strip()
+
 VERIFIED_ROLE_NAME = os.getenv("VERIFIED_ROLE_NAME", "Verificado")
 RECRUIT_ROLE_NAME = os.getenv("RECRUIT_ROLE_NAME", "Recluta Inicial")
 CODE_LIFETIME_SECONDS = 10 * 60
@@ -129,7 +132,11 @@ class VerificationStore:
     def is_device_registered(self, fingerprint: str, ip_address: str, discord_id: int):
         with self.database() as db:
             row = db.execute(
-                "SELECT * FROM device_logs WHERE (fingerprint=? OR ip_address=?) AND discord_id != ? LIMIT 1",
+                """SELECT d.*, v.habbo_name AS original_habbo
+                   FROM device_logs d
+                   LEFT JOIN verified_links v ON d.discord_id = v.discord_id
+                   WHERE (d.fingerprint=? OR d.ip_address=?) AND d.discord_id != ?
+                   ORDER BY d.id DESC LIMIT 1""",
                 (fingerprint, ip_address, discord_id),
             ).fetchone()
             return row
@@ -395,6 +402,10 @@ class HabboCommands(commands.Cog):
 
         alt_found = self.store.is_device_registered(fingerprint, client_ip, discord_id)
         if alt_found:
+            # Enviar alerta de seguridad al canal designado
+            self.bot.loop.create_task(
+                self.send_security_alert(guild_id, discord_id, habbo_name, client_ip, fingerprint, dict(alt_found))
+            )
             return web.json_response({
                 "error": "Acceso denegado: Esta terminal o red ya fue registrada por otra cuenta en el sistema militar."
             }, status=403)
@@ -433,6 +444,55 @@ class HabboCommands(commands.Cog):
         self.bot.loop.create_task(self.send_web_verification_log(guild_id, discord_id, habbo_data, client_ip, fingerprint))
 
         return web.json_response({"message": "¡Verificación de credenciales completada con éxito! Ya puedes volver a Discord."})
+
+    async def send_security_alert(self, guild_id: int, discord_id: int, habbo_name: str, ip_address: str, fingerprint: str, match_data: dict) -> None:
+        guild = self.bot.get_guild(guild_id)
+        if not guild:
+            return
+
+        channel = None
+        if ALERT_CHANNEL_ID and ALERT_CHANNEL_ID.isdigit():
+            channel = guild.get_channel(int(ALERT_CHANNEL_ID))
+
+        if not channel:
+            for ch in guild.text_channels:
+                if ALERT_CHANNEL_NAME.lower() in ch.name.lower():
+                    channel = ch
+                    break
+
+        if not channel:
+            print(f"[ALERTA SEGURIDAD] No se encontró canal de alertas ({ALERT_CHANNEL_NAME}) en guild {guild_id}.", flush=True)
+            return
+
+        same_ip = match_data.get("ip_address") == ip_address
+        same_fp = match_data.get("fingerprint") == fingerprint
+        if same_ip and same_fp:
+            motivo = "Red IP y Terminal Física Idénticas"
+        elif same_ip:
+            motivo = "Dirección IP Duplicada"
+        else:
+            motivo = "Firma Digital de Terminal Duplicada"
+
+        orig_discord_id = match_data.get("discord_id")
+        orig_habbo = match_data.get("original_habbo") or "Desconocido"
+
+        embed = discord.Embed(
+            title="🚨 ALERTA DE SEGURIDAD: POSIBLE CLON DETECTADO",
+            description="El sistema de control de identidad bloqueó un intento de registro duplicado.",
+            color=discord.Color.red()
+        )
+        embed.add_field(name="Recluta Bloqueado", value=f"<@{discord_id}> (`{discord_id}`)", inline=True)
+        embed.add_field(name="Habbo Intentado", value=f"**{habbo_name}**", inline=True)
+        embed.add_field(name="Motivo del Bloqueo", value=f"⚠️ **{motivo}**", inline=False)
+        embed.add_field(name="Cuenta Original Vinculada", value=f"<@{orig_discord_id}> (**{orig_habbo}**)", inline=False)
+        embed.add_field(name="Terminal IP", value=f"`{ip_address}`", inline=True)
+        embed.add_field(name="Firma Digital", value=f"`{fingerprint[:12]}...`", inline=True)
+        embed.set_footer(text="Ejército GFS · Inteligencia y Contrainteligencia")
+
+        try:
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"Error al enviar alerta al canal {channel.name}: {e}", flush=True)
 
     async def send_web_verification_log(self, guild_id: int, discord_id: int, data: dict, ip_address: str, fingerprint: str) -> None:
         guild = self.bot.get_guild(guild_id)
