@@ -11,6 +11,7 @@ from discord.ext import commands
 
 ACTIVITIES_CHANNEL_NAME = os.getenv("ACTIVITIES_CHANNEL_NAME", "registro-actividades")
 ACTIVITIES_CHANNEL_ID = os.getenv("ACTIVITIES_CHANNEL_ID", "").strip()
+VERIFIED_ROLE_NAME = os.getenv("VERIFIED_ROLE_NAME", "Verificado")
 
 POINTS_PARTICIPANT = 1
 POINTS_WINNER = 3
@@ -43,6 +44,13 @@ class PointsStore:
         with self.database() as db:
             db.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS verified_links (
+                    discord_id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    habbo_unique_id TEXT NOT NULL UNIQUE,
+                    habbo_name TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    verified_at INTEGER NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS military_points (
                     discord_id INTEGER PRIMARY KEY,
                     habbo_name TEXT NOT NULL COLLATE NOCASE,
@@ -85,6 +93,20 @@ class PointsStore:
             return db.execute(
                 "SELECT * FROM verified_links WHERE habbo_name=? COLLATE NOCASE LIMIT 1",
                 (habbo_name.strip(),),
+            ).fetchone()
+
+    def restore_verified_from_guild(self, discord_id: int, guild_id: int, habbo_name: str):
+        with self.database() as db:
+            db.execute(
+                """INSERT INTO verified_links (discord_id, guild_id, habbo_unique_id, habbo_name, verified_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(discord_id) DO UPDATE SET
+                     habbo_name=excluded.habbo_name""",
+                (discord_id, guild_id, f"discord-sync-{discord_id}", habbo_name.strip(), int(time.time())),
+            )
+            return db.execute(
+                "SELECT * FROM verified_links WHERE discord_id=? LIMIT 1",
+                (discord_id,),
             ).fetchone()
 
     def get_verified_by_discord(self, discord_id: int):
@@ -254,12 +276,12 @@ class LeaderboardView(discord.ui.View):
 
     @discord.ui.button(label="Consultar Mi Saldo", style=discord.ButtonStyle.primary, emoji="💳", custom_id="pts_balance")
     async def balance_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        link = self.cog.store.get_verified_by_discord(interaction.user.id)
+        link = self.cog.resolve_verified_member(interaction.guild, interaction.user.display_name)
         if not link:
             return await interaction.response.send_message(
                 "❌ No estás verificado en la base militar. Completa tu registro primero.", ephemeral=True
             )
-        bal = self.cog.store.get_user_balance(interaction.user.id)
+        bal = self.cog.store.get_user_balance(int(link["discord_id"]))
         if not bal:
             return await interaction.response.send_message(
                 f"🎖️ **{link['habbo_name']}**, aún no registras puntos en el ciclo mensual actual (**0 pts**).",
@@ -285,6 +307,33 @@ class PointsCommands(commands.Cog):
 
     async def cog_load(self) -> None:
         self.bot.add_view(LeaderboardView(self, 0))
+
+    def resolve_verified_member(self, guild: discord.Guild, habbo_name: str):
+        # 1. Buscar primero en SQLite
+        row = self.store.get_verified_user(habbo_name)
+        if row:
+            return dict(row)
+
+        # 2. Si SQLite se reinició por deploy, respaldar buscando miembros con rol Verificado en Discord
+        if not guild:
+            return None
+        target = habbo_name.strip().casefold()
+        verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+
+        for member in guild.members:
+            if member.bot:
+                continue
+            if verified_role and verified_role not in member.roles:
+                continue
+            candidates = {
+                member.display_name.strip().casefold(),
+                member.name.strip().casefold(),
+            }
+            if target in candidates:
+                restored = self.store.restore_verified_from_guild(member.id, guild.id, habbo_name.strip())
+                return dict(restored) if restored else None
+
+        return None
 
     def is_activities_channel(self, channel: discord.abc.GuildChannel) -> bool:
         if not channel:
@@ -371,7 +420,7 @@ class PointsCommands(commands.Cog):
 
         unverified = []
 
-        guide_row = self.store.get_verified_user(parsed["guide"])
+        guide_row = self.resolve_verified_member(message.guild, parsed["guide"])
         if not guide_row:
             unverified.append(f"Encargado(a): `{parsed['guide']}`")
 
@@ -382,19 +431,19 @@ class PointsCommands(commands.Cog):
             if key in seen_part:
                 continue
             seen_part.add(key)
-            row = self.store.get_verified_user(p_name)
+            row = self.resolve_verified_member(message.guild, p_name)
             if not row:
                 unverified.append(f"Participante: `{p_name}`")
             else:
-                valid_participants.append(dict(row))
+                valid_participants.append(row)
 
         valid_winners = []
         for w_name in parsed["winners"]:
-            row = self.store.get_verified_user(w_name)
+            row = self.resolve_verified_member(message.guild, w_name)
             if not row:
                 unverified.append(f"Ganador(a): `{w_name}`")
             else:
-                valid_winners.append(dict(row))
+                valid_winners.append(row)
 
         if unverified:
             try:
@@ -405,7 +454,7 @@ class PointsCommands(commands.Cog):
             error_list = "\n".join(f"• {item}" for item in dict.fromkeys(unverified))
             await message.reply(
                 "⚠️ **Registro en pausa — Personal no verificado detectado**\n"
-                "Los siguientes nombres no coinciden con ningún oficial verificado en la base de datos:\n"
+                "Los siguientes nombres no coinciden con ningún oficial verificado en el servidor:\n"
                 f"{error_list}\n\n"
                 "*Edita tu mensaje corrigiendo la ortografía o pide al recluta que se verifique. El bot lo procesará automáticamente al editarlo.*",
                 delete_after=45,
@@ -416,7 +465,7 @@ class PointsCommands(commands.Cog):
         self.store.record_activity(
             message_id=message.id,
             guild_id=message.guild.id,
-            guide=dict(guide_row),
+            guide=guide_row,
             game_name=parsed["game"],
             activity_date=parsed["date"],
             participants=valid_participants,
@@ -482,6 +531,16 @@ class PointsCommands(commands.Cog):
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
 
+    @app_commands.command(name="vincular_oficial", description="Vincula manualmente un Discord con su nombre de Habbo (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def vincular_oficial(self, interaction: discord.Interaction, usuario_discord: discord.Member, habbo_usuario: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        self.store.restore_verified_from_guild(usuario_discord.id, interaction.guild.id, habbo_usuario.strip())
+        await interaction.followup.send(
+            f"✅ Oficial {usuario_discord.mention} vinculado manualmente con **{habbo_usuario.strip()}**.",
+            ephemeral=True,
+        )
+
     @app_commands.command(name="tablero_puntos", description="Publica el tablero dinámico de puntos en este canal (Solo Admins).")
     @app_commands.checks.has_permissions(administrator=True)
     async def tablero_puntos(self, interaction: discord.Interaction) -> None:
@@ -504,7 +563,7 @@ class PointsCommands(commands.Cog):
         if costo_puntos <= 0:
             return await interaction.followup.send("❌ El costo en puntos debe ser mayor a 0.", ephemeral=True)
 
-        link = self.store.get_verified_user(habbo_usuario)
+        link = self.resolve_verified_member(interaction.guild, habbo_usuario)
         if not link:
             return await interaction.followup.send(f"❌ El usuario **{habbo_usuario}** no está verificado.", ephemeral=True)
 
@@ -544,7 +603,7 @@ class PointsCommands(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def ajustar_puntos(self, interaction: discord.Interaction, habbo_usuario: str, puntos: int, motivo: str) -> None:
         await interaction.response.defer(ephemeral=True)
-        link = self.store.get_verified_user(habbo_usuario)
+        link = self.resolve_verified_member(interaction.guild, habbo_usuario)
         if not link:
             return await interaction.followup.send(f"❌ El usuario **{habbo_usuario}** no está verificado.", ephemeral=True)
 
