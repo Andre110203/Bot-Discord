@@ -841,8 +841,7 @@ class PointsCommands(commands.Cog):
 
         await self.refresh_live_board(interaction.guild)
         await interaction.followup.send(embed=embed)
-
-    @app_commands.command(name="ajustar_puntos", description="Suma o resta puntos manualmente a un oficial verificado (Solo Admins).")
+@app_commands.command(name="ajustar_puntos", description="Suma o resta puntos manualmente a un oficial verificado (Solo Admins).")
     @app_commands.checks.has_permissions(administrator=True)
     async def ajustar_puntos(self, interaction: discord.Interaction, habbo_usuario: str, puntos: int, motivo: str) -> None:
         await interaction.response.defer(ephemeral=True)
@@ -853,4 +852,31 @@ class PointsCommands(commands.Cog):
         habbo_oficial = link["habbo_name"]
         self.store.adjust_points(int(link["discord_id"]), habbo_oficial, puntos)
         bal = self.store.get_user_balance(int(link["discord_id"]))
-        await
+        await self.refresh_live_board(interaction.guild)
+        await interaction.followup.send(
+            f"✅ Ajuste aplicado a **{habbo_oficial}**: `{puntos:+d} pts`.\n"
+            f"• **Motivo:** {motivo}\n"
+            f"• **Nuevo saldo disponible:** **{bal['available']} pts**",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="reiniciar_ciclo_puntos", description="Reinicia los puntos del ciclo mensual a cero (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def reiniciar_ciclo_puntos(self, interaction: discord.Interaction, confirmar: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if confirmar.strip().upper() != "CONFIRMAR":
+            return await interaction.followup.send(
+                "⚠️ Acción cancelada. Para reiniciar el ciclo mensual debes escribir exactamente `CONFIRMAR` en el parámetro.",
+                ephemeral=True,
+            )
+
+        self.store.reset_monthly_cycle()
+        await self.refresh_live_board(interaction.guild)
+        await interaction.followup.send(
+            "🔄 **Ciclo mensual de puntos reiniciado a 0.** Todos los registros anteriores han sido limpiados.",
+            ephemeral=True,
+        )
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(PointsCommands(bot))
