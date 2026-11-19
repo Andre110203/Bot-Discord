@@ -287,9 +287,11 @@ class HabboCommands(commands.Cog):
         app.router.add_get("/health", self.api_health)
         app.router.add_post("/api/challenge/create", self.api_create_challenge)
         app.router.add_post("/api/challenge/verify", self.api_verify_challenge)
-        
+
         app.router.add_get("/verify", self.handle_verify_page)
         app.router.add_post("/api/confirm", self.handle_api_confirm)
+        app.router.add_get("/tablero", self.handle_tablero_page)
+        app.router.add_get("/api/tablero", self.handle_api_tablero)
 
         port = int(os.getenv("PORT", "10000"))
         self.web_runner = web.AppRunner(app)
@@ -297,6 +299,325 @@ class HabboCommands(commands.Cog):
         site = web.TCPSite(self.web_runner, "0.0.0.0", port)
         await site.start()
         print(f"🌐 Servidor Web HTTP activo escuchando en el puerto {port}", flush=True)
+
+    async def handle_api_tablero(self, _request: web.Request) -> web.Response:
+        ranking = []
+        try:
+            with self.store.database() as db:
+                table_exists = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='military_points'"
+                ).fetchone()
+                if table_exists:
+                    rows = db.execute("SELECT * FROM military_points").fetchall()
+                    for r in rows:
+                        d = dict(r)
+                        earned = (
+                            d["points_participation"]
+                            + d["points_wins"]
+                            + d["points_guide"]
+                            + d["points_adjusted"]
+                        )
+                        available = earned - d["points_spent"]
+                        if earned > 0 or available > 0:
+                            ranking.append({
+                                "habbo_name": d["habbo_name"],
+                                "available": available,
+                                "earned": earned,
+                                "participation": d["points_participation"],
+                                "wins": d["points_wins"],
+                                "guide": d["points_guide"],
+                                "adjusted": d["points_adjusted"],
+                                "spent": d["points_spent"],
+                            })
+        except Exception as exc:
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+        ranking.sort(key=lambda x: (x["available"], x["earned"]), reverse=True)
+        return web.json_response({
+            "ok": True,
+            "updated_at": int(time.time()),
+            "total_officials": len(ranking),
+            "ranking": ranking,
+        })
+
+    async def handle_tablero_page(self, _request: web.Request) -> web.Response:
+        html_content = """<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tablero Oficial de Puntos — Ejército GFS</title>
+    <style>
+        :root {
+            --bg-main: #0e1117;
+            --bg-card: #161b26;
+            --bg-row: #1c2230;
+            --bg-row-hover: #242c3d;
+            --border: #2a3447;
+            --gold: #f5b942;
+            --silver: #c0c8d6;
+            --bronze: #d4845a;
+            --accent: #3b82f6;
+            --green: #10b981;
+            --text-main: #f1f5f9;
+            --text-muted: #94a3b8;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: radial-gradient(circle at top, #182032 0%, var(--bg-main) 65%);
+            color: var(--text-main);
+            min-height: 100vh;
+            padding: 28px 16px 60px;
+        }
+        .container { max-width: 1050px; margin: 0 auto; }
+        header {
+            text-align: center;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 28px 20px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+            margin-bottom: 24px;
+            position: relative;
+            overflow: hidden;
+        }
+        header::before {
+            content: "";
+            position: absolute;
+            top: 0; left: 0; right: 0; height: 4px;
+            background: linear-gradient(90deg, var(--gold), var(--accent), var(--gold));
+        }
+        .badge-live {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            background: rgba(16, 185, 129, 0.14);
+            color: var(--green);
+            border: 1px solid rgba(16, 185, 129, 0.35);
+            padding: 5px 14px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            letter-spacing: 0.6px;
+            text-transform: uppercase;
+            margin-bottom: 12px;
+        }
+        .dot {
+            width: 8px; height: 8px;
+            background: var(--green);
+            border-radius: 50%;
+            animation: pulse 1.6s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.35; transform: scale(0.8); }
+        }
+        h1 { font-size: 26px; letter-spacing: 0.8px; color: #fff; margin-bottom: 8px; }
+        .subtitle { color: var(--text-muted); font-size: 14px; margin-bottom: 16px; }
+        .scale-pills {
+            display: flex; flex-wrap: wrap; justify-content: center; gap: 10px;
+        }
+        .pill {
+            background: #1f2737; border: 1px solid var(--border);
+            padding: 6px 14px; border-radius: 8px; font-size: 13px; color: #e2e8f0;
+        }
+        .pill strong { color: var(--gold); }
+
+        .podium {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+        .podium-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 18px;
+            text-align: center;
+            position: relative;
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+        }
+        .podium-card.rank-1 { border-color: rgba(245, 185, 66, 0.65); background: linear-gradient(180deg, rgba(245,185,66,0.1) 0%, var(--bg-card) 60%); }
+        .podium-card.rank-2 { border-color: rgba(192, 200, 214, 0.5); }
+        .podium-card.rank-3 { border-color: rgba(212, 132, 90, 0.5); }
+        .rank-tag {
+            font-size: 13px; font-weight: 800; padding: 4px 12px; border-radius: 999px;
+            display: inline-block; margin-bottom: 8px;
+        }
+        .rank-1 .rank-tag { background: rgba(245,185,66,0.2); color: var(--gold); }
+        .rank-2 .rank-tag { background: rgba(192,200,214,0.2); color: var(--silver); }
+        .rank-3 .rank-tag { background: rgba(212,132,90,0.2); color: var(--bronze); }
+        .podium-avatar { width: 64px; height: 110px; object-fit: contain; margin: -6px auto 4px; display: block; }
+        .podium-name { font-size: 17px; font-weight: 700; color: #fff; }
+        .podium-pts { font-size: 22px; font-weight: 800; color: var(--gold); margin-top: 4px; }
+        .podium-sub { font-size: 12px; color: var(--text-muted); }
+
+        .toolbar {
+            display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
+            gap: 12px; margin-bottom: 14px;
+        }
+        .search-box {
+            flex: 1; min-width: 240px;
+            background: var(--bg-card); border: 1px solid var(--border);
+            color: #fff; padding: 11px 16px; border-radius: 10px; font-size: 14px;
+            outline: none;
+        }
+        .search-box:focus { border-color: var(--accent); }
+        .last-update { font-size: 12px; color: var(--text-muted); }
+
+        .table-wrap {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            overflow-x: auto;
+            box-shadow: 0 8px 25px rgba(0,0,0,0.35);
+        }
+        table { width: 100%; border-collapse: collapse; text-align: left; }
+        th {
+            background: #121620; color: var(--text-muted);
+            font-size: 12px; text-transform: uppercase; letter-spacing: 0.6px;
+            padding: 14px 16px; border-bottom: 1px solid var(--border);
+        }
+        td { padding: 12px 16px; border-bottom: 1px solid rgba(42,52,71,0.55); font-size: 14px; vertical-align: middle; }
+        tr:last-child td { border-bottom: none; }
+        tbody tr { background: var(--bg-row); transition: background 0.15s; }
+        tbody tr:hover { background: var(--bg-row-hover); }
+        .user-cell { display: flex; align-items: center; gap: 10px; font-weight: 700; color: #fff; }
+        .head-img { width: 34px; height: 34px; border-radius: 8px; background: #10141d; border: 1px solid var(--border); }
+        .pts-avail { font-weight: 800; color: var(--gold); font-size: 15px; }
+        .pos-badge { font-weight: 800; color: var(--text-muted); font-family: monospace; font-size: 14px; }
+        .empty-state { text-align: center; padding: 40px 20px; color: var(--text-muted); }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <div class="badge-live"><span class="dot"></span> En Vivo · Actualización Automática</div>
+        <h1>🏆 TABLERO OFICIAL DE PUNTOS — EJÉRCITO GFS</h1>
+        <p class="subtitle">Clasificación mensual de mérito militar y saldo disponible para canje de membresías</p>
+        <div class="scale-pills">
+            <div class="pill">🎮 Participación: <strong>+1 pt</strong></div>
+            <div class="pill">🏅 Ronda Ganada: <strong>+3 pts</strong></div>
+            <div class="pill">🎖️ Guía / Encargado: <strong>+5 pts</strong></div>
+        </div>
+    </header>
+
+    <section id="podium" class="podium"></section>
+
+    <div class="toolbar">
+        <input type="text" id="searchInput" class="search-box" placeholder="🔍 Buscar oficial por nombre de Habbo..." oninput="renderTable()">
+        <div class="last-update" id="lastUpdate">Sincronizando con la base militar...</div>
+    </div>
+
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>Pos</th>
+                    <th>Oficial</th>
+                    <th>Disponibles</th>
+                    <th>Total Mes</th>
+                    <th>Part.</th>
+                    <th>Victorias</th>
+                    <th>Guía</th>
+                    <th>Canjeados</th>
+                </tr>
+            </thead>
+            <tbody id="rankingBody">
+                <tr><td colspan="8" class="empty-state">⏳ Cargando clasificación oficial...</td></tr>
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    let allRanking = [];
+
+    function avatarFull(name) {
+        return `https://www.habbo.es/habbo-imaging/avatarimage?user=${encodeURIComponent(name)}&direction=2&head_direction=3&gesture=sml&size=m`;
+    }
+    function avatarHead(name) {
+        return `https://www.habbo.es/habbo-imaging/avatarimage?user=${encodeURIComponent(name)}&direction=2&head_direction=3&headonly=1&size=m`;
+    }
+
+    function renderPodium() {
+        const podiumEl = document.getElementById("podium");
+        const top3 = allRanking.slice(0, 3);
+        if (top3.length === 0) {
+            podiumEl.innerHTML = "";
+            return;
+        }
+        const labels = ["🥇 1er Lugar", "🥈 2do Lugar", "🥉 3er Lugar"];
+        podiumEl.innerHTML = top3.map((u, i) => `
+            <div class="podium-card rank-${i + 1}">
+                <span class="rank-tag">${labels[i]}</span>
+                <img class="podium-avatar" src="${avatarFull(u.habbo_name)}" alt="${u.habbo_name}" onerror="this.style.display='none'">
+                <div class="podium-name">${u.habbo_name}</div>
+                <div class="podium-pts">${u.available} pts</div>
+                <div class="podium-sub">Acumulado del mes: ${u.earned} pts</div>
+            </div>
+        `).join("");
+    }
+
+    function renderTable() {
+        const query = document.getElementById("searchInput").value.trim().toLowerCase();
+        const tbody = document.getElementById("rankingBody");
+
+        const indexed = allRanking.map((item, idx) => ({ ...item, rank: idx + 1 }));
+        const filtered = query ? indexed.filter(u => u.habbo_name.toLowerCase().includes(query)) : indexed;
+
+        if (filtered.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="8" class="empty-state">No se encontraron oficiales registrados en el ciclo actual.</td></tr>`;
+            return;
+        }
+
+        tbody.innerHTML = filtered.map(u => {
+            const medal = u.rank === 1 ? "🥇" : u.rank === 2 ? "🥈" : u.rank === 3 ? "🥉" : `#${String(u.rank).padStart(2, "0")}`;
+            return `
+                <tr>
+                    <td class="pos-badge">${medal}</td>
+                    <td>
+                        <div class="user-cell">
+                            <img class="head-img" src="${avatarHead(u.habbo_name)}" alt="">
+                            <span>${u.habbo_name}</span>
+                        </div>
+                    </td>
+                    <td class="pts-avail">${u.available} pts</td>
+                    <td>${u.earned} pts</td>
+                    <td>${u.participation}</td>
+                    <td>${u.wins}</td>
+                    <td>${u.guide}</td>
+                    <td>${u.spent}</td>
+                </tr>
+            `;
+        }).join("");
+    }
+
+    async function fetchRanking() {
+        try {
+            const res = await fetch("/api/tablero");
+            const data = await res.json();
+            if (data.ok) {
+                allRanking = data.ranking || [];
+                renderPodium();
+                renderTable();
+                const now = new Date();
+                document.getElementById("lastUpdate").textContent =
+                    `Actualizado: ${now.toLocaleTimeString()} · ${data.total_officials} oficiales activos`;
+            }
+        } catch (e) {
+            document.getElementById("lastUpdate").textContent = "⚠️ Reconectando con el servidor...";
+        }
+    }
+
+    fetchRanking();
+    setInterval(fetchRanking, 10000);
+</script>
+</body>
+</html>"""
+        return web.Response(text=html_content, content_type="text/html")
 
     async def handle_verify_page(self, request: web.Request) -> web.Response:
         token = request.query.get("token")
@@ -402,7 +723,6 @@ class HabboCommands(commands.Cog):
 
         alt_found = self.store.is_device_registered(fingerprint, client_ip, discord_id)
         if alt_found:
-            # Enviar alerta de seguridad al canal designado
             self.bot.loop.create_task(
                 self.send_security_alert(guild_id, discord_id, habbo_name, client_ip, fingerprint, dict(alt_found))
             )
@@ -426,14 +746,14 @@ class HabboCommands(commands.Cog):
                     await member.edit(nick=habbo_data["name"])
                 except (discord.Forbidden, discord.HTTPException):
                     pass
-                
+
                 role_verified = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
                 if role_verified:
                     try:
                         await member.add_roles(role_verified)
                     except (discord.Forbidden, discord.HTTPException):
                         pass
-                
+
                 role_recruit = discord.utils.get(guild.roles, name=RECRUIT_ROLE_NAME)
                 if role_recruit:
                     try:
@@ -671,7 +991,7 @@ class HabboCommands(commands.Cog):
         habbo_name = str(payload.get("habbo_name", "")).strip()
         if not habbo_name:
             return web.json_response({"ok": False, "message": "Falta el usuario Habbo."}, status=422)
-        
+
         link = self.store.linked_habbo(habbo_name)
         if not link:
             return web.json_response({"ok": False, "message": "Este Habbo no está verificado en Discord."}, status=404)
@@ -708,106 +1028,108 @@ class HabboCommands(commands.Cog):
 
         challenge_id = str(payload.get("challenge_id", "")).strip()
         habbo_name = str(payload.get("habbo_name", "")).strip()
-        motto = str(payload.get("motto", "")).strip()
-        verified = self.store.consume_web_challenge(challenge_id, habbo_name, motto)
-        if not verified:
+        if not challenge_id or not habbo_name:
+            return web.json_response({"ok": False, "message": "Datos incompletos."}, status=422)
+
+        habbo_data = await self.fetch_habbo_user(habbo_name)
+        if not habbo_data:
+            return web.json_response({"ok": False, "message": "No se pudo consultar Habbo."}, status=502)
+
+        motto = str(habbo_data.get("motto", ""))
+        consumed = self.store.consume_web_challenge(challenge_id, habbo_name, motto)
+        if not consumed:
             return web.json_response(
-                {"ok": False, "message": "Código incorrecto, vencido o ya utilizado."}, status=422
+                {"ok": False, "message": "Código inválido, expirado o no coincide con tu misión actual."},
+                status=400,
             )
         return web.json_response(
             {
                 "ok": True,
-                "discord_id": str(verified["discord_id"]),
-                "habbo_name": verified["habbo_name"],
-                "habbo_unique_id": verified["habbo_unique_id"],
+                "discord_id": str(consumed["discord_id"]),
+                "habbo_unique_id": consumed["habbo_unique_id"],
+                "habbo_name": consumed["habbo_name"],
             }
         )
 
-    @app_commands.command(name="sync", description="Fuerza la sincronización de comandos Slash en el servidor (Solo Admins).")
+    @app_commands.command(name="panel_verificacion", description="Publica el panel de registro militar (Solo Admins).")
     @app_commands.checks.has_permissions(administrator=True)
-    async def sync_commands(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True)
-        synced = await self.bot.tree.sync(guild=interaction.guild)
-        await interaction.followup.send(f"✅ Se sincronizaron **{len(synced)}** comandos Slash en este servidor.", ephemeral=True)
+    async def panel_verificacion(self, interaction: discord.Interaction) -> None:
+        embed = discord.Embed(
+            title="🎖️ CENTRO DE IDENTIFICACIÓN MILITAR — EJÉRCITO GFS",
+            description=(
+                "Para acceder a las instalaciones y canales operativos del servidor, debes vincular tu personaje oficial de **Habbo.es**.\n\n"
+                "**Instrucciones:**\n"
+                "1. Presiona el botón verde **Iniciar Registro Militar**.\n"
+                "2. Escribe el nombre exacto de tu personaje de Habbo.\n"
+                "3. Abre el enlace privado de validación y confirma tu identidad."
+            ),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text="Ejército GFS · Sistema Oficial de Identificación")
+        await interaction.channel.send(embed=embed, view=VerificationView(self))
+        await interaction.response.send_message("✅ Panel de verificación publicado correctamente.", ephemeral=True)
 
-    @app_commands.command(name="perfil", description="Muestra el perfil público de un usuario de Habbo.")
+    @app_commands.command(name="verificar_web", description="Genera un enlace privado de verificación web.")
+    async def verificar_web(self, interaction: discord.Interaction, habbo_name: str) -> None:
+        await self.start_web_verification_flow(interaction, habbo_name)
+
+    @app_commands.command(name="check_logs", description="Consulta registros de seguridad de terminales (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def check_logs(self, interaction: discord.Interaction, usuario_discord: discord.Member = None) -> None:
+        await interaction.response.defer(ephemeral=True)
+        with self.store.database() as db:
+            if usuario_discord:
+                rows = db.execute(
+                    "SELECT * FROM device_logs WHERE discord_id=? ORDER BY id DESC LIMIT 10",
+                    (usuario_discord.id,),
+                ).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM device_logs ORDER BY id DESC LIMIT 10").fetchall()
+
+        if not rows:
+            return await interaction.followup.send("No se encontraron registros de seguridad.", ephemeral=True)
+
+        lines = [
+            f"• <@{r['discord_id']}> | IP: `{r['ip_address']}` | FP: `{r['fingerprint'][:10]}...`"
+            for r in rows
+        ]
+        await interaction.followup.send("🛡️ **Últimos Registros de Seguridad:**\n" + "\n".join(lines), ephemeral=True)
+
+    @app_commands.command(name="perfil", description="Muestra la ficha pública de un usuario de Habbo.es.")
     async def perfil(self, interaction: discord.Interaction, usuario: str) -> None:
         await interaction.response.defer()
         data = await self.fetch_habbo_user(usuario)
         if not data:
-            await interaction.followup.send("❌ Usuario no encontrado.", ephemeral=True)
-            return
+            return await interaction.followup.send(f"❌ No se encontró el personaje **{usuario}** en Habbo.es.")
+
+        figure = data.get("figureString", "")
         online = "🟢 En línea" if data.get("online") else "🔴 Desconectado"
-        embed = discord.Embed(title=f"Perfil de Habbo: {data['name']}", color=discord.Color.gold())
-        embed.add_field(name="Misión", value=data.get("motto") or "Sin misión", inline=False)
-        embed.add_field(name="Estado", value=online)
-        embed.add_field(name="Miembro desde", value=str(data.get("memberSince", "Desconocido")).split("T")[0])
-        embed.set_thumbnail(url=f"{IMAGING_URL}?figure={data.get('figureString','')}&size=l")
+        embed = discord.Embed(title=f"🪪 Ficha Militar — {data['name']}", color=discord.Color.gold())
+        embed.add_field(name="Misión", value=data.get("motto") or "*Sin misión*", inline=False)
+        embed.add_field(name="Estado", value=online, inline=True)
+        embed.add_field(name="Creación", value=str(data.get("memberSince", ""))[:10], inline=True)
+        embed.set_thumbnail(url=f"{IMAGING_URL}?figure={figure}&direction=2&head_direction=3&gesture=sml&size=l")
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="avatar", description="Obtiene la imagen del avatar de Habbo.")
+    @app_commands.command(name="avatar", description="Muestra el avatar completo de un personaje de Habbo.es.")
     async def avatar(self, interaction: discord.Interaction, usuario: str) -> None:
         await interaction.response.defer()
         data = await self.fetch_habbo_user(usuario)
         if not data:
-            await interaction.followup.send("❌ Usuario no encontrado.", ephemeral=True)
-            return
-        embed = discord.Embed(title=f"Avatar de {data['name']}", color=discord.Color.blue())
-        embed.set_image(url=f"{IMAGING_URL}?figure={data.get('figureString','')}&direction=2&head_direction=2&gesture=sml&size=l")
+            return await interaction.followup.send(f"❌ No se encontró el personaje **{usuario}** en Habbo.es.")
+
+        figure = data.get("figureString", "")
+        embed = discord.Embed(title=f"🧍 Avatar — {data['name']}", color=discord.Color.blue())
+        embed.set_image(url=f"{IMAGING_URL}?figure={figure}&direction=2&head_direction=3&size=l")
         await interaction.followup.send(embed=embed)
 
-    @app_commands.command(name="verificar_web", description="Verificación oficial de credenciales militares.")
-    async def verificar_web(self, interaction: discord.Interaction, habbo_name: str) -> None:
-        await self.start_web_verification_flow(interaction, habbo_name)
-
-    @app_commands.command(name="check_logs", description="Consulta la base militar de identidades (Solo Admins).")
+    @app_commands.command(name="sync", description="Sincroniza manualmente los comandos del servidor (Solo Admins).")
     @app_commands.checks.has_permissions(administrator=True)
-    async def check_logs(self, interaction: discord.Interaction, usuario_discord: discord.User = None) -> None:
+    async def sync_cmd(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True)
-        target_user = usuario_discord or interaction.user
-        target_id = target_user.id
-
-        with self.store.database() as db:
-            link = db.execute("SELECT * FROM verified_links WHERE discord_id=?", (target_id,)).fetchone()
-            logs = db.execute("SELECT * FROM device_logs WHERE discord_id=? ORDER BY id DESC LIMIT 5", (target_id,)).fetchall()
-
-        if not link and not logs:
-            return await interaction.followup.send(f"❌ No hay registros en la base militar para {target_user.mention}.", ephemeral=True)
-
-        embed = discord.Embed(
-            title=f"🔎 Registros de Identificación - {target_user.display_name}",
-            color=discord.Color.blue()
-        )
-
-        if link:
-            embed.add_field(name="Habbo Vinculado", value=f"**{link['habbo_name']}** (`{link['habbo_unique_id']}`)", inline=False)
-
-        if logs:
-            history = ""
-            for log in logs:
-                history += f"• **IP:** `{log['ip_address']}` | **Firma:** `{log['fingerprint'][:12]}...`\n"
-            embed.add_field(name="Historial de Terminales", value=history, inline=False)
-        else:
-            embed.add_field(name="Historial de Terminales", value="⚠️ Sin registros de terminal registrados.", inline=False)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-    @app_commands.command(name="panel_verificacion", description="Publica el panel oficial de identificación militar.")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def panel_verificacion(self, interaction: discord.Interaction) -> None:
-        embed = discord.Embed(
-            title="🛡️ Control de Identidad Militar GFS",
-            description=(
-                "Presiona el botón de abajo para iniciar la vinculación oficial de tu cuenta de Habbo.es con la base del ejército.\n\n"
-                "• Se actualizará tu apodo con tu nombre oficial de tropa.\n"
-                "• Recibirás acceso directo a las instalaciones de Discord.\n"
-                "• Se asignarán tus rangos de inicio correspondientes."
-            ),
-            color=discord.Color.blue(),
-        )
-        embed.set_footer(text="Ejército GFS · Sistema Oficial de Verificación")
-        await interaction.channel.send(embed=embed, view=VerificationView(self))
-        await interaction.response.send_message("✅ Panel militar publicado con éxito.", ephemeral=True)
+        self.bot.tree.copy_global_to(guild=interaction.guild)
+        synced = await self.bot.tree.sync(guild=interaction.guild)
+        await interaction.followup.send(f"✅ Sincronizados {len(synced)} comandos.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
