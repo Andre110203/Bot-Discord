@@ -301,6 +301,8 @@ class LeaderboardView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self.page = page
+        web_url = os.getenv("RENDER_EXTERNAL_URL", "https://bot-discord-yau4.onrender.com").rstrip("/") + "/tablero"
+        self.add_item(discord.ui.Button(label="Tablero Web", style=discord.ButtonStyle.link, url=web_url, emoji="🌐"))
 
     @discord.ui.button(label="Anterior", style=discord.ButtonStyle.secondary, emoji="⬅️", custom_id="pts_prev")
     async def prev_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
