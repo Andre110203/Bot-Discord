@@ -841,7 +841,7 @@ class PointsCommands(commands.Cog):
 
         await self.refresh_live_board(interaction.guild)
         await interaction.followup.send(embed=embed)
-@app_commands.command(name="ajustar_puntos", description="Suma o resta puntos manualmente a un oficial verificado (Solo Admins).")
+    @app_commands.command(name="ajustar_puntos", description="Suma o resta puntos manualmente a un oficial verificado (Solo Admins).")
     @app_commands.checks.has_permissions(administrator=True)
     async def ajustar_puntos(self, interaction: discord.Interaction, habbo_usuario: str, puntos: int, motivo: str) -> None:
         await interaction.response.defer(ephemeral=True)
