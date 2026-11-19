@@ -3,6 +3,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import discord
@@ -78,6 +79,16 @@ class PointsStore:
                     membership_name TEXT NOT NULL,
                     cost INTEGER NOT NULL,
                     admin_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS transfers_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sender_discord_id INTEGER NOT NULL,
+                    sender_habbo TEXT NOT NULL,
+                    receiver_discord_id INTEGER NOT NULL,
+                    receiver_habbo TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    reason TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS board_config (
@@ -195,6 +206,37 @@ class PointsStore:
             data["available"] = earned - data["points_spent"]
             return data
 
+    def transfer_points(
+        self,
+        sender_id: int,
+        sender_habbo: str,
+        receiver_id: int,
+        receiver_habbo: str,
+        amount: int,
+        reason: str,
+    ) -> bool:
+        now = int(time.time())
+        with self.database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM military_points WHERE discord_id=? LIMIT 1", (sender_id,)).fetchone()
+            if not row:
+                return False
+            earned = row["points_participation"] + row["points_wins"] + row["points_guide"] + row["points_adjusted"]
+            available = earned - row["points_spent"]
+            if available < amount:
+                return False
+
+            self._upsert_points(db, sender_id, sender_habbo, adj_pts=-amount, now=now)
+            self._upsert_points(db, receiver_id, receiver_habbo, adj_pts=amount, now=now)
+
+            db.execute(
+                """INSERT INTO transfers_log
+                   (sender_discord_id, sender_habbo, receiver_discord_id, receiver_habbo, amount, reason, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (sender_id, sender_habbo, receiver_id, receiver_habbo, amount, reason, now),
+            )
+            return True
+
     def redeem_membership(self, discord_id: int, habbo_name: str, membership_name: str, cost: int, admin_id: int) -> bool:
         now = int(time.time())
         with self.database() as db:
@@ -276,7 +318,7 @@ class LeaderboardView(discord.ui.View):
 
     @discord.ui.button(label="Consultar Mi Saldo", style=discord.ButtonStyle.primary, emoji="💳", custom_id="pts_balance")
     async def balance_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
-        link = self.cog.resolve_verified_member(interaction.guild, interaction.user.display_name)
+        link = self.cog.resolve_verified_by_member(interaction.guild, interaction.user)
         if not link:
             return await interaction.response.send_message(
                 "❌ No estás verificado en la base militar. Completa tu registro primero.", ephemeral=True
@@ -295,8 +337,9 @@ class LeaderboardView(discord.ui.View):
         embed.add_field(name="🎮 Participación (+1)", value=f"{bal['points_participation']} pts", inline=True)
         embed.add_field(name="🏆 Victorias (+3)", value=f"{bal['points_wins']} pts", inline=True)
         embed.add_field(name="🎖️ Guía/Encargado (+5)", value=f"{bal['points_guide']} pts", inline=True)
+        embed.add_field(name="🔄 Ajustes / Cesiones", value=f"{bal['points_adjusted']:+d} pts", inline=True)
         embed.add_field(name="🛍️ Canjeados en Membresías", value=f"{bal['points_spent']} pts", inline=True)
-        embed.add_field(name="📊 Total Acumulado del Mes", value=f"{bal['earned']} pts", inline=True)
+        embed.add_field(name="📊 Total Neto del Mes", value=f"{bal['earned']} pts", inline=True)
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -308,13 +351,21 @@ class PointsCommands(commands.Cog):
     async def cog_load(self) -> None:
         self.bot.add_view(LeaderboardView(self, 0))
 
+    def resolve_verified_by_member(self, guild: discord.Guild, member: discord.Member):
+        row = self.store.get_verified_by_discord(member.id)
+        if row:
+            return dict(row)
+        verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+        if verified_role and verified_role in member.roles:
+            restored = self.store.restore_verified_from_guild(member.id, guild.id, member.display_name.strip())
+            return dict(restored) if restored else None
+        return None
+
     def resolve_verified_member(self, guild: discord.Guild, habbo_name: str):
-        # 1. Buscar primero en SQLite
         row = self.store.get_verified_user(habbo_name)
         if row:
             return dict(row)
 
-        # 2. Si SQLite se reinició por deploy, respaldar buscando miembros con rol Verificado en Discord
         if not guild:
             return None
         target = habbo_name.strip().casefold()
@@ -333,6 +384,16 @@ class PointsCommands(commands.Cog):
                 restored = self.store.restore_verified_from_guild(member.id, guild.id, habbo_name.strip())
                 return dict(restored) if restored else None
 
+        return None
+
+    def find_activities_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        if ACTIVITIES_CHANNEL_ID and ACTIVITIES_CHANNEL_ID.isdigit():
+            ch = guild.get_channel(int(ACTIVITIES_CHANNEL_ID))
+            if isinstance(ch, discord.TextChannel):
+                return ch
+        for ch in guild.text_channels:
+            if ACTIVITIES_CHANNEL_NAME.lower() in ch.name.lower():
+                return ch
         return None
 
     def is_activities_channel(self, channel: discord.abc.GuildChannel) -> bool:
@@ -373,6 +434,7 @@ class PointsCommands(commands.Cog):
                 section = "winners"
             elif section == "participants":
                 name = re.sub(r"^[\-\•\*\d\.\)\s]+", "", clean).strip()
+                name = re.sub(r"\s*\(.*?\)\s*$", "", name).strip()
                 if name:
                     raw_participants.append(name)
             elif section == "winners":
@@ -380,6 +442,7 @@ class PointsCommands(commands.Cog):
                     name = clean.split(":", 1)[1].strip()
                 else:
                     name = re.sub(r"^[\-\•\*\d\.\)\s]+", "", clean).strip()
+                name = re.sub(r"\s*\(.*?\)\s*$", "", name).strip()
                 if name and name.lower() not in ("nadie", "ninguno", "-", "n/a"):
                     raw_winners.append(name)
 
@@ -393,6 +456,36 @@ class PointsCommands(commands.Cog):
             "participants": raw_participants,
             "winners": raw_winners,
         }
+
+    def validate_and_extract_entries(self, guild: discord.Guild, parsed: dict):
+        unverified = []
+
+        guide_row = self.resolve_verified_member(guild, parsed["guide"])
+        if not guide_row:
+            unverified.append(f"Encargado(a): `{parsed['guide']}`")
+
+        seen_part = set()
+        valid_participants = []
+        for p_name in parsed["participants"]:
+            key = p_name.casefold()
+            if key in seen_part:
+                continue
+            seen_part.add(key)
+            row = self.resolve_verified_member(guild, p_name)
+            if not row:
+                unverified.append(f"Participante: `{p_name}`")
+            else:
+                valid_participants.append(row)
+
+        valid_winners = []
+        for w_name in parsed["winners"]:
+            row = self.resolve_verified_member(guild, w_name)
+            if not row:
+                unverified.append(f"Ganador(a): `{w_name}`")
+            else:
+                valid_winners.append(row)
+
+        return guide_row, valid_participants, valid_winners, unverified
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -418,32 +511,9 @@ class PointsCommands(commands.Cog):
         if not parsed:
             return
 
-        unverified = []
-
-        guide_row = self.resolve_verified_member(message.guild, parsed["guide"])
-        if not guide_row:
-            unverified.append(f"Encargado(a): `{parsed['guide']}`")
-
-        seen_part = set()
-        valid_participants = []
-        for p_name in parsed["participants"]:
-            key = p_name.casefold()
-            if key in seen_part:
-                continue
-            seen_part.add(key)
-            row = self.resolve_verified_member(message.guild, p_name)
-            if not row:
-                unverified.append(f"Participante: `{p_name}`")
-            else:
-                valid_participants.append(row)
-
-        valid_winners = []
-        for w_name in parsed["winners"]:
-            row = self.resolve_verified_member(message.guild, w_name)
-            if not row:
-                unverified.append(f"Ganador(a): `{w_name}`")
-            else:
-                valid_winners.append(row)
+        guide_row, valid_participants, valid_winners, unverified = self.validate_and_extract_entries(
+            message.guild, parsed
+        )
 
         if unverified:
             try:
@@ -530,6 +600,147 @@ class PointsCommands(commands.Cog):
             await msg.edit(embed=embed, view=LeaderboardView(self, 0))
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             pass
+
+    @app_commands.command(
+        name="recalcular_historial",
+        description="Escanea los mensajes del canal de actividades y reconstruye los puntos perdidos (Solo Admins).",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def recalcular_historial(
+        self,
+        interaction: discord.Interaction,
+        solo_mes_actual: bool = True,
+        limite_mensajes: int = 500,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        channel = self.find_activities_channel(interaction.guild)
+        if not channel:
+            return await interaction.followup.send(
+                "❌ No se encontró el canal de registro de actividades.", ephemeral=True
+            )
+
+        limite = max(10, min(limite_mensajes, 2000))
+        now = datetime.now(timezone.utc)
+        after_dt = datetime(now.year, now.month, 1, tzinfo=timezone.utc) if solo_mes_actual else None
+
+        recovered = 0
+        already_counted = 0
+        skipped_unverified = []
+
+        async for msg in channel.history(limit=limite, after=after_dt, oldest_first=True):
+            if msg.author.bot:
+                continue
+
+            if self.store.is_activity_processed(msg.id):
+                already_counted += 1
+                continue
+
+            parsed = self.parse_activity_template(msg.content)
+            if not parsed:
+                continue
+
+            guide_row, valid_participants, valid_winners, unverified = self.validate_and_extract_entries(
+                interaction.guild, parsed
+            )
+
+            if unverified:
+                skipped_unverified.append(f"• [Mensaje]({msg.jump_url}): {', '.join(dict.fromkeys(unverified))}")
+                continue
+
+            summary = f"Guía: {guide_row['habbo_name']} | Part: {len(valid_participants)} | Rondas: {len(valid_winners)}"
+            self.store.record_activity(
+                message_id=msg.id,
+                guild_id=interaction.guild.id,
+                guide=guide_row,
+                game_name=parsed["game"],
+                activity_date=parsed["date"],
+                participants=valid_participants,
+                winners=valid_winners,
+                summary_text=summary,
+            )
+            recovered += 1
+
+            has_check = any(str(r.emoji) == "✅" for r in msg.reactions)
+            if not has_check:
+                try:
+                    await msg.clear_reactions()
+                    await msg.add_reaction("✅")
+                except discord.HTTPException:
+                    pass
+
+        await self.refresh_live_board(interaction.guild)
+
+        report = [
+            "🔄 **Reconstrucción de Historial Completada**",
+            f"• **Canal escaneado:** {channel.mention}",
+            f"• **Actividades recuperadas y sumadas:** `{recovered}`",
+            f"• **Actividades ya registradas (omitidas):** `{already_counted}`",
+        ]
+        if skipped_unverified:
+            preview = "\n".join(skipped_unverified[:10])
+            report.append(f"\n⚠️ **Registros omitidos por personal no verificado ({len(skipped_unverified)}):**\n{preview}")
+
+        await interaction.followup.send("\n".join(report), ephemeral=True)
+
+    @app_commands.command(name="regalar_puntos", description="Cede o regala puntos de tu saldo disponible a otro oficial verificado.")
+    async def regalar_puntos(
+        self,
+        interaction: discord.Interaction,
+        destinatario_habbo: str,
+        cantidad: int,
+        motivo: str = "Cesión voluntaria de puntos",
+    ) -> None:
+        await interaction.response.defer()
+        if cantidad <= 0:
+            return await interaction.followup.send("❌ La cantidad a transferir debe ser mayor a **0 pts**.", ephemeral=True)
+
+        sender = self.resolve_verified_by_member(interaction.guild, interaction.user)
+        if not sender:
+            return await interaction.followup.send(
+                "❌ No estás verificado en la base militar. Completa tu registro primero.", ephemeral=True
+            )
+
+        receiver = self.resolve_verified_member(interaction.guild, destinatario_habbo)
+        if not receiver:
+            return await interaction.followup.send(
+                f"❌ El destinatario **{destinatario_habbo}** no figura como oficial verificado.", ephemeral=True
+            )
+
+        if int(sender["discord_id"]) == int(receiver["discord_id"]):
+            return await interaction.followup.send("❌ No puedes transferirte puntos a ti mismo.", ephemeral=True)
+
+        success = self.store.transfer_points(
+            sender_id=int(sender["discord_id"]),
+            sender_habbo=sender["habbo_name"],
+            receiver_id=int(receiver["discord_id"]),
+            receiver_habbo=receiver["habbo_name"],
+            amount=cantidad,
+            reason=motivo,
+        )
+        if not success:
+            bal = self.store.get_user_balance(int(sender["discord_id"]))
+            disp = bal["available"] if bal else 0
+            return await interaction.followup.send(
+                f"❌ No tienes saldo suficiente para realizar esta transferencia. Disponible actual: **{disp} pts**.",
+                ephemeral=True,
+            )
+
+        sender_bal = self.store.get_user_balance(int(sender["discord_id"]))
+        receiver_bal = self.store.get_user_balance(int(receiver["discord_id"]))
+
+        embed = discord.Embed(
+            title="🤝 Cesión Oficial de Puntos Registrada",
+            description=f"<@{sender['discord_id']}> ha transferido puntos de su saldo a <@{receiver['discord_id']}>.",
+            color=discord.Color.teal(),
+        )
+        embed.add_field(name="Emisor", value=f"**{sender['habbo_name']}**\n*(Saldo restante: {sender_bal['available']} pts)*", inline=True)
+        embed.add_field(name="Beneficiario", value=f"**{receiver['habbo_name']}**\n*(Nuevo saldo: {receiver_bal['available']} pts)*", inline=True)
+        embed.add_field(name="Monto Transferido", value=f"**{cantidad} pts**", inline=True)
+        embed.add_field(name="Motivo", value=motivo, inline=False)
+        embed.set_footer(text="Ejército GFS · Registro Transparente de Mérito")
+
+        await self.refresh_live_board(interaction.guild)
+        await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="vincular_oficial", description="Vincula manualmente un Discord con su nombre de Habbo (Solo Admins).")
     @app_commands.checks.has_permissions(administrator=True)
