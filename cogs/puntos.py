@@ -19,6 +19,19 @@ POINTS_WINNER = 3
 POINTS_GUIDE = 5
 
 
+def clean_raw_name(text: str) -> str:
+    # Eliminar caracteres invisibles de copia/pega, backticks, asteriscos y escapes \_
+    cleaned = re.sub(r"[\u200b-\u200f\ufeff`*]", "", text)
+    cleaned = cleaned.replace(r"\_", "_").replace(r"\.", ".")
+    return cleaned.strip()
+
+
+def normalize_habbo_key(name: str) -> str:
+    # Elimina puntos y guiones bajos al inicio o final para tolerar el formateo de cursiva de Discord
+    base = clean_raw_name(name).casefold()
+    return re.sub(r"^[._\-]+|[._\-]+$", "", base)
+
+
 class PointsStore:
     def __init__(self) -> None:
         default_path = Path(__file__).resolve().parents[1] / "data" / "verification.sqlite3"
@@ -100,11 +113,23 @@ class PointsStore:
             )
 
     def get_verified_user(self, habbo_name: str):
+        cleaned = clean_raw_name(habbo_name)
+        target_norm = normalize_habbo_key(cleaned)
         with self.database() as db:
-            return db.execute(
+            exact = db.execute(
                 "SELECT * FROM verified_links WHERE habbo_name=? COLLATE NOCASE LIMIT 1",
-                (habbo_name.strip(),),
+                (cleaned,),
             ).fetchone()
+            if exact:
+                return exact
+
+            # Búsqueda tolerante si Discord recortó el "_" por cursiva (ej. ".Andre." -> ".Andre_.")
+            if target_norm:
+                all_rows = db.execute("SELECT * FROM verified_links").fetchall()
+                for row in all_rows:
+                    if normalize_habbo_key(row["habbo_name"]) == target_norm:
+                        return row
+        return None
 
     def restore_verified_from_guild(self, discord_id: int, guild_id: int, habbo_name: str):
         with self.database() as db:
@@ -364,13 +389,15 @@ class PointsCommands(commands.Cog):
         return None
 
     def resolve_verified_member(self, guild: discord.Guild, habbo_name: str):
-        row = self.store.get_verified_user(habbo_name)
+        cleaned = clean_raw_name(habbo_name)
+        row = self.store.get_verified_user(cleaned)
         if row:
             return dict(row)
 
         if not guild:
             return None
-        target = habbo_name.strip().casefold()
+        target = cleaned.casefold()
+        target_norm = normalize_habbo_key(cleaned)
         verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
 
         for member in guild.members:
@@ -378,12 +405,13 @@ class PointsCommands(commands.Cog):
                 continue
             if verified_role and verified_role not in member.roles:
                 continue
-            candidates = {
-                member.display_name.strip().casefold(),
-                member.name.strip().casefold(),
-            }
-            if target in candidates:
-                restored = self.store.restore_verified_from_guild(member.id, guild.id, habbo_name.strip())
+            raw_candidates = [member.display_name.strip(), member.name.strip()]
+            exact_candidates = {c.casefold() for c in raw_candidates}
+            norm_candidates = {normalize_habbo_key(c) for c in raw_candidates if normalize_habbo_key(c)}
+
+            if target in exact_candidates or (target_norm and target_norm in norm_candidates):
+                official_name = member.display_name.strip() if normalize_habbo_key(member.display_name) == target_norm else cleaned
+                restored = self.store.restore_verified_from_guild(member.id, guild.id, official_name)
                 return dict(restored) if restored else None
 
         return None
@@ -418,7 +446,7 @@ class PointsCommands(commands.Cog):
         raw_winners = []
 
         for line in lines:
-            clean = line.replace("*", "").strip()
+            clean = clean_raw_name(line)
             lower = clean.lower()
 
             if "fecha:" in lower:
@@ -428,23 +456,25 @@ class PointsCommands(commands.Cog):
                 game_str = clean.split(":", 1)[1].strip()
                 section = None
             elif "encargado" in lower and ":" in lower:
-                guide_str = clean.split(":", 1)[1].strip()
+                guide_str = clean_raw_name(clean.split(":", 1)[1])
                 section = None
             elif "participantes" in lower:
                 section = "participants"
             elif "ganadores" in lower:
                 section = "winners"
             elif section == "participants":
-                name = re.sub(r"^[\-\•\*\d\.\)\s]+", "", clean).strip()
+                name = re.sub(r"^[\-\•\*\d\)\s]+", "", clean).strip()
                 name = re.sub(r"\s*\(.*?\)\s*$", "", name).strip()
+                name = clean_raw_name(name)
                 if name:
                     raw_participants.append(name)
             elif section == "winners":
                 if ":" in clean:
                     name = clean.split(":", 1)[1].strip()
                 else:
-                    name = re.sub(r"^[\-\•\*\d\.\)\s]+", "", clean).strip()
+                    name = re.sub(r"^[\-\•\*\d\)\s]+", "", clean).strip()
                 name = re.sub(r"\s*\(.*?\)\s*$", "", name).strip()
+                name = clean_raw_name(name)
                 if name and name.lower() not in ("nadie", "ninguno", "-", "n/a"):
                     raw_winners.append(name)
 
@@ -469,7 +499,7 @@ class PointsCommands(commands.Cog):
         seen_part = set()
         valid_participants = []
         for p_name in parsed["participants"]:
-            key = p_name.casefold()
+            key = normalize_habbo_key(p_name) or p_name.casefold()
             if key in seen_part:
                 continue
             seen_part.add(key)
@@ -823,42 +853,4 @@ class PointsCommands(commands.Cog):
         habbo_oficial = link["habbo_name"]
         self.store.adjust_points(int(link["discord_id"]), habbo_oficial, puntos)
         bal = self.store.get_user_balance(int(link["discord_id"]))
-        await self.refresh_live_board(interaction.guild)
-        signo = "+" if puntos >= 0 else ""
-        await interaction.followup.send(
-            f"✅ Ajuste aplicado a **{habbo_oficial}** (`{signo}{puntos} pts`). Nuevo saldo disponible: **{bal['available']} pts**.\n**Motivo:** {motivo}",
-            ephemeral=True,
-        )
-
-    @app_commands.command(name="cierre_mensual", description="Publica el acta final del mes y reinicia el tablero a 0 (Solo Admins).")
-    @app_commands.checks.has_permissions(administrator=True)
-    async def cierre_mensual(self, interaction: discord.Interaction, mes_cerrado: str) -> None:
-        await interaction.response.defer()
-        ranking = self.store.get_leaderboard()
-
-        embed = discord.Embed(
-            title=f"📜 ACTA OFICIAL DE CIERRE MENSUAL — {mes_cerrado.upper()}",
-            description="Se da por concluido el ciclo mensual de actividades del **Ejército GFS**. Los contadores han sido reiniciados para el nuevo mes.",
-            color=discord.Color.blue(),
-        )
-
-        if ranking:
-            top_lines = []
-            medals = {0: "🥇", 1: "🥈", 2: "🥉"}
-            for idx, entry in enumerate(ranking[:15]):
-                prefix = medals.get(idx, f"`#{idx + 1:02d}`")
-                top_lines.append(
-                    f"{prefix} **{entry['habbo_name']}** — Acumulado: **{entry['earned']} pts** *(Saldo sin canjear: {entry['available']} pts)*"
-                )
-            embed.add_field(name="🎖️ Cuadro de Honor del Mes", value="\n".join(top_lines), inline=False)
-        else:
-            embed.add_field(name="Resumen", value="No hubo puntos registrados durante este periodo.", inline=False)
-
-        embed.set_footer(text=f"Cierre ejecutado por {interaction.user.display_name} · Ejército GFS")
-        self.store.reset_monthly_cycle()
-        await self.refresh_live_board(interaction.guild)
-        await interaction.followup.send(embed=embed)
-
-
-async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(PointsCommands(bot))
+        await
