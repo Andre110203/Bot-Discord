@@ -20,14 +20,12 @@ POINTS_GUIDE = 5
 
 
 def clean_raw_name(text: str) -> str:
-    # Eliminar caracteres invisibles de copia/pega, backticks, asteriscos y escapes \_
     cleaned = re.sub(r"[\u200b-\u200f\ufeff`*]", "", text)
     cleaned = cleaned.replace(r"\_", "_").replace(r"\.", ".")
     return cleaned.strip()
 
 
 def normalize_habbo_key(name: str) -> str:
-    # Elimina puntos y guiones bajos al inicio o final para tolerar el formateo de cursiva de Discord
     base = clean_raw_name(name).casefold()
     return re.sub(r"^[._\-]+|[._\-]+$", "", base)
 
@@ -123,7 +121,6 @@ class PointsStore:
             if exact:
                 return exact
 
-            # Búsqueda tolerante si Discord recortó el "_" por cursiva (ej. ".Andre." -> ".Andre_.")
             if target_norm:
                 all_rows = db.execute("SELECT * FROM verified_links").fetchall()
                 for row in all_rows:
@@ -144,6 +141,60 @@ class PointsStore:
                 "SELECT * FROM verified_links WHERE discord_id=? LIMIT 1",
                 (discord_id,),
             ).fetchone()
+
+    def create_provisional_user(self, habbo_name: str):
+        cleaned = clean_raw_name(habbo_name)
+        prov_id = -(abs(hash(cleaned.casefold())) % 900_000_000 + 100_000_000)
+        with self.database() as db:
+            db.execute(
+                """INSERT INTO verified_links (discord_id, guild_id, habbo_unique_id, habbo_name, verified_at)
+                   VALUES (?, 0, ?, ?, ?)
+                   ON CONFLICT(habbo_name) DO NOTHING""",
+                (prov_id, f"provisional-{cleaned.casefold()}", cleaned, int(time.time())),
+            )
+            return db.execute(
+                "SELECT * FROM verified_links WHERE habbo_name=? COLLATE NOCASE LIMIT 1",
+                (cleaned,),
+            ).fetchone()
+
+    def merge_provisional_to_discord(self, real_discord_id: int, guild_id: int, habbo_name: str) -> None:
+        cleaned = clean_raw_name(habbo_name)
+        with self.database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            prov = db.execute(
+                "SELECT * FROM verified_links WHERE habbo_name=? COLLATE NOCASE AND discord_id < 0 LIMIT 1",
+                (cleaned,),
+            ).fetchone()
+            if not prov:
+                return
+
+            prov_id = int(prov["discord_id"])
+            prov_pts = db.execute(
+                "SELECT * FROM military_points WHERE discord_id=? LIMIT 1",
+                (prov_id,),
+            ).fetchone()
+
+            if prov_pts:
+                self._upsert_points(
+                    db,
+                    real_discord_id,
+                    cleaned,
+                    part_pts=prov_pts["points_participation"],
+                    win_pts=prov_pts["points_wins"],
+                    guide_pts=prov_pts["points_guide"],
+                    adj_pts=prov_pts["points_adjusted"],
+                    spent_pts=prov_pts["points_spent"],
+                    now=int(time.time()),
+                )
+                db.execute("DELETE FROM military_points WHERE discord_id=?", (prov_id,))
+
+            db.execute("DELETE FROM verified_links WHERE discord_id=?", (prov_id,))
+            db.execute(
+                """INSERT INTO verified_links (discord_id, guild_id, habbo_unique_id, habbo_name, verified_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(discord_id) DO UPDATE SET habbo_name=excluded.habbo_name""",
+                (real_discord_id, guild_id, f"discord-sync-{real_discord_id}", cleaned, int(time.time())),
+            )
 
     def get_verified_by_discord(self, discord_id: int):
         with self.database() as db:
@@ -378,15 +429,36 @@ class PointsCommands(commands.Cog):
     async def cog_load(self) -> None:
         self.bot.add_view(LeaderboardView(self, 0))
 
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        await self.sync_all_verified_members()
+
+    async def sync_all_verified_members(self) -> int:
+        synced = 0
+        for guild in self.bot.guilds:
+            verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+            if not verified_role:
+                continue
+            for member in guild.members:
+                if member.bot or verified_role not in member.roles:
+                    continue
+                habbo_nick = clean_raw_name(member.display_name)
+                if habbo_nick:
+                    self.store.merge_provisional_to_discord(member.id, guild.id, habbo_nick)
+                    if not self.store.get_verified_by_discord(member.id):
+                        self.store.restore_verified_from_guild(member.id, guild.id, habbo_nick)
+                        synced += 1
+        return synced
+
     def resolve_verified_by_member(self, guild: discord.Guild, member: discord.Member):
-        row = self.store.get_verified_by_discord(member.id)
-        if row:
-            return dict(row)
         verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
         if verified_role and verified_role in member.roles:
-            restored = self.store.restore_verified_from_guild(member.id, guild.id, member.display_name.strip())
+            habbo_nick = clean_raw_name(member.display_name)
+            self.store.merge_provisional_to_discord(member.id, guild.id, habbo_nick)
+            restored = self.store.restore_verified_from_guild(member.id, guild.id, habbo_nick)
             return dict(restored) if restored else None
-        return None
+        row = self.store.get_verified_by_discord(member.id)
+        return dict(row) if row else None
 
     def resolve_verified_member(self, guild: discord.Guild, habbo_name: str):
         cleaned = clean_raw_name(habbo_name)
@@ -411,6 +483,7 @@ class PointsCommands(commands.Cog):
 
             if target in exact_candidates or (target_norm and target_norm in norm_candidates):
                 official_name = member.display_name.strip() if normalize_habbo_key(member.display_name) == target_norm else cleaned
+                self.store.merge_provisional_to_discord(member.id, guild.id, official_name)
                 restored = self.store.restore_verified_from_guild(member.id, guild.id, official_name)
                 return dict(restored) if restored else None
 
@@ -778,9 +851,11 @@ class PointsCommands(commands.Cog):
     @app_commands.checks.has_permissions(administrator=True)
     async def vincular_oficial(self, interaction: discord.Interaction, usuario_discord: discord.Member, habbo_usuario: str) -> None:
         await interaction.response.defer(ephemeral=True)
-        self.store.restore_verified_from_guild(usuario_discord.id, interaction.guild.id, habbo_usuario.strip())
+        clean_nick = habbo_usuario.strip()
+        self.store.merge_provisional_to_discord(usuario_discord.id, interaction.guild.id, clean_nick)
+        self.store.restore_verified_from_guild(usuario_discord.id, interaction.guild.id, clean_nick)
         await interaction.followup.send(
-            f"✅ Oficial {usuario_discord.mention} vinculado manualmente con **{habbo_usuario.strip()}**.",
+            f"✅ Oficial {usuario_discord.mention} vinculado con **{clean_nick}** (puntos provisionales fusionados si existían).",
             ephemeral=True,
         )
 
@@ -841,6 +916,7 @@ class PointsCommands(commands.Cog):
 
         await self.refresh_live_board(interaction.guild)
         await interaction.followup.send(embed=embed)
+
     @app_commands.command(name="ajustar_puntos", description="Suma o resta puntos manualmente a un oficial verificado (Solo Admins).")
     @app_commands.checks.has_permissions(administrator=True)
     async def ajustar_puntos(self, interaction: discord.Interaction, habbo_usuario: str, puntos: int, motivo: str) -> None:
@@ -859,6 +935,48 @@ class PointsCommands(commands.Cog):
             f"• **Nuevo saldo disponible:** **{bal['available']} pts**",
             ephemeral=True,
         )
+
+    @app_commands.command(
+        name="importar_puntos",
+        description="Carga masiva de puntos desde una lista Usuario:Puntos (Solo Admins).",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def importar_puntos(self, interaction: discord.Interaction, lista_puntos: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        entries = re.split(r"[\n,;]+", lista_puntos.strip())
+        loaded = 0
+        provisional_created = []
+        invalid = []
+
+        for raw in entries:
+            item = raw.strip()
+            if not item:
+                continue
+            m = re.match(r"^(.+?)\s*[:=\t]\s*(-?\d+)$", item) or re.match(r"^(\S+)\s+(-?\d+)$", item)
+            if not m:
+                invalid.append(f"`{item}`")
+                continue
+
+            habbo_name = clean_raw_name(m.group(1))
+            pts = int(m.group(2))
+            link = self.resolve_verified_member(interaction.guild, habbo_name)
+            if not link:
+                link = dict(self.store.create_provisional_user(habbo_name))
+                provisional_created.append(habbo_name)
+
+            self.store.adjust_points(int(link["discord_id"]), link["habbo_name"], pts)
+            loaded += 1
+
+        await self.refresh_live_board(interaction.guild)
+        msg = [f"✅ **Importación completada:** `{loaded}` oficiales cargados en el tablero."]
+        if provisional_created:
+            msg.append(
+                f"⏳ **Cargados como provisionales ({len(provisional_created)})** *(se vincularán solos cuando se verifiquen)*:\n"
+                + ", ".join(f"`{u}`" for u in provisional_created)
+            )
+        if invalid:
+            msg.append("⚠️ **Con error de formato:** " + ", ".join(invalid))
+        await interaction.followup.send("\n\n".join(msg), ephemeral=True)
 
     @app_commands.command(name="reiniciar_ciclo_puntos", description="Reinicia los puntos del ciclo mensual a cero (Solo Admins).")
     @app_commands.checks.has_permissions(administrator=True)
