@@ -557,3 +557,595 @@ class PointsStore:
         with self.database() as db:
             db.execute("DELETE FROM military_points")
             db.execute("DELETE FROM activity_logs")
+class RewardSelect(discord.ui.Select):
+    def __init__(self, cog, requester_id: int, habbo_name: str, available_pts: int) -> None:
+        self.cog = cog
+        self.requester_id = requester_id
+        self.habbo_name = habbo_name
+        self.available_pts = available_pts
+
+        options = []
+        for key, item in REWARDS_CATALOG.items():
+            options.append(
+                discord.SelectOption(
+                    label=f"{item['name']} — {item['cost']} pts ({item['period']})",
+                    value=key,
+                    description=item["desc"][:100],
+                    emoji=item["emoji"],
+                )
+            )
+        super().__init__(
+            placeholder="Selecciona el premio que deseas canjear...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.requester_id:
+            return await interaction.response.send_message("❌ Este menú pertenece a otro usuario.", ephemeral=True)
+
+        reward_key = self.values[0]
+        reward = REWARDS_CATALOG[reward_key]
+
+        allowed, next_ts = self.cog.store.check_reward_limit(self.requester_id, reward_key)
+        if not allowed:
+            return await interaction.response.edit_message(
+                content=(
+                    f"⛔ **Límite de Canje Alcanzado ({reward['period']})**\n"
+                    f"Ya reclamaste **{reward['name']}** dentro de este periodo.\n"
+                    f"• **Próximo canje habilitado:** <t:{next_ts}:F> (<t:{next_ts}:R>)."
+                ),
+                embed=None,
+                view=None,
+            )
+
+        bal = self.cog.store.get_user_balance(self.requester_id)
+        disp = bal["available"] if bal else 0
+        if disp < reward["cost"]:
+            return await interaction.response.edit_message(
+                content=(
+                    f"❌ **Puntos Insuficientes**\n"
+                    f"Para canjear **{reward['name']}** necesitas **{reward['cost']} pts**, pero tu saldo disponible actual es de **{disp} pts**."
+                ),
+                embed=None,
+                view=None,
+            )
+
+        req_embed = discord.Embed(
+            title="📋 Solicitud de Canje de Puntos — Pendiente de Autorización",
+            description=(
+                f"El oficial <@{self.requester_id}> (**{self.habbo_name}**) solicita canjear puntos de su cuenta.\n"
+                f"*Requiere aprobación de **{HIGH_RANK_ROLE_NAME}** o Administración.*"
+            ),
+            color=discord.Color.orange(),
+        )
+        req_embed.add_field(name="Premio Solicitado", value=f"{reward['emoji']} **{reward['name']}**", inline=True)
+        req_embed.add_field(name="Costo", value=f"**{reward['cost']} pts**", inline=True)
+        req_embed.add_field(name="Límite / Reclamación", value=f"**{reward['period']}**", inline=True)
+        req_embed.add_field(name="Saldo Actual del Oficial", value=f"{disp} pts *(Quedarían {disp - reward['cost']} pts)*", inline=False)
+        req_embed.set_footer(text="Ejército GFS · Control de Recompensas y Ascensos")
+
+        approval_view = RedemptionApprovalView(
+            cog=self.cog,
+            requester_id=self.requester_id,
+            habbo_name=self.habbo_name,
+            reward_key=reward_key,
+        )
+
+        await interaction.channel.send(embed=req_embed, view=approval_view)
+        await interaction.response.edit_message(
+            content=f"✅ **Solicitud enviada.** Un miembro de **{HIGH_RANK_ROLE_NAME}** revisará y autorizará tu canje de **{reward['name']}** en este canal.",
+            embed=None,
+            view=None,
+        )
+
+
+class RewardCatalogView(discord.ui.View):
+    def __init__(self, cog, requester_id: int, habbo_name: str, available_pts: int) -> None:
+        super().__init__(timeout=180)
+        self.add_item(RewardSelect(cog, requester_id, habbo_name, available_pts))
+
+
+class RedemptionApprovalView(discord.ui.View):
+    def __init__(self, cog, requester_id: int, habbo_name: str, reward_key: str) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.requester_id = requester_id
+        self.habbo_name = habbo_name
+        self.reward_key = reward_key
+
+    @discord.ui.button(label="Autorizar Canje", style=discord.ButtonStyle.success, emoji="✅")
+    async def approve_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not is_high_rank(interaction.user):
+            return await interaction.response.send_message(
+                f"❌ Solo miembros con el rango **{HIGH_RANK_ROLE_NAME}** o Administradores pueden autorizar canjes.",
+                ephemeral=True,
+            )
+
+        success, reason = self.cog.store.redeem_reward_atomic(
+            discord_id=self.requester_id,
+            habbo_name=self.habbo_name,
+            reward_key=self.reward_key,
+            admin_id=interaction.user.id,
+        )
+
+        if not success:
+            for child in self.children:
+                child.disabled = True
+            await interaction.message.edit(view=self)
+            return await interaction.response.send_message(f"⚠️ No se pudo completar el canje: {reason}", ephemeral=True)
+
+        reward = REWARDS_CATALOG[self.reward_key]
+        bal = self.cog.store.get_user_balance(self.requester_id)
+        remaining = bal["available"] if bal else 0
+
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+
+        announce_embed = discord.Embed(
+            title="🎉 CANJE OFICIAL AUTORIZADO — EJÉRCITO GFS",
+            description=(
+                f"El oficial <@{self.requester_id}> (**{self.habbo_name}**) ha canjeado sus puntos exitosamente "
+                f"y fue autorizado por {interaction.user.mention}."
+            ),
+            color=discord.Color.green(),
+        )
+        announce_embed.add_field(name="Premio Obtenido", value=f"{reward['emoji']} **{reward['name']}**", inline=True)
+        announce_embed.add_field(name="Puntos Canjeados", value=f"`-{reward['cost']} pts`", inline=True)
+        announce_embed.add_field(name="Reclamación", value=reward["period"], inline=True)
+        announce_embed.add_field(name="Saldo Restante", value=f"**{remaining} pts**", inline=True)
+        announce_embed.add_field(name="Autorizado por", value=interaction.user.mention, inline=True)
+        announce_embed.set_footer(text="Ejército GFS · Tesorería y Mérito Militar")
+
+        await self.cog.refresh_live_board(interaction.guild)
+        await interaction.response.send_message(embed=announce_embed)
+
+    @discord.ui.button(label="Rechazar", style=discord.ButtonStyle.danger, emoji="❌")
+    async def reject_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if not is_high_rank(interaction.user):
+            return await interaction.response.send_message(
+                f"❌ Solo miembros con el rango **{HIGH_RANK_ROLE_NAME}** o Administradores pueden rechazar solicitudes.",
+                ephemeral=True,
+            )
+
+        reward = REWARDS_CATALOG[self.reward_key]
+        for child in self.children:
+            child.disabled = True
+        await interaction.message.edit(view=self)
+        await interaction.response.send_message(
+            f"❌ La solicitud de canje de **{reward['name']}** para <@{self.requester_id}> (**{self.habbo_name}) fue rechazada por {interaction.user.mention}."
+        )
+
+
+class LeaderboardView(discord.ui.View):
+    def __init__(self, cog, page: int = 0) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.page = page
+        web_url = os.getenv("RENDER_EXTERNAL_URL", "https://bot-discord-yau4.onrender.com").rstrip("/") + "/tablero"
+        self.add_item(discord.ui.Button(label="Tablero Web", style=discord.ButtonStyle.link, url=web_url, emoji="🌐"))
+
+    @discord.ui.button(label="Anterior", style=discord.ButtonStyle.secondary, emoji="⬅️", custom_id="pts_prev")
+    async def prev_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        new_page = max(0, self.page - 1)
+        embed = self.cog.build_leaderboard_embed(interaction.guild, new_page)
+        await interaction.response.edit_message(embed=embed, view=LeaderboardView(self.cog, new_page))
+
+    @discord.ui.button(label="Siguiente", style=discord.ButtonStyle.secondary, emoji="➡️", custom_id="pts_next")
+    async def next_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        ranking = self.cog.store.get_leaderboard()
+        max_page = max(0, (len(ranking) - 1) // 15)
+        new_page = min(max_page, self.page + 1)
+        embed = self.cog.build_leaderboard_embed(interaction.guild, new_page)
+        await interaction.response.edit_message(embed=embed, view=LeaderboardView(self.cog, new_page))
+
+    @discord.ui.button(label="Consultar Mi Saldo", style=discord.ButtonStyle.primary, emoji="💳", custom_id="pts_balance")
+    async def balance_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        link = self.cog.resolve_verified_by_member(interaction.guild, interaction.user)
+        if not link:
+            return await interaction.response.send_message(
+                "❌ No estás verificado en la base militar. Completa tu registro primero.", ephemeral=True
+            )
+        bal = self.cog.store.get_user_balance(int(link["discord_id"]))
+        if not bal:
+            return await interaction.response.send_message(
+                f"🎖️ **, aún no registras puntos en el ciclo mensual actual (**0 pts**).",
+                ephemeral=True,
+            )
+        embed = discord.Embed(
+            title=f"💳 Estado de Cuenta Militar — {link['habbo_name']}",
+            color=discord.Color.gold(),
+        )
+        embed.add_field(name="💰 Puntos Disponibles (Canjeables)", value=f"**{bal['available']} pts**", inline=False)
+        embed.add_field(name="🎮 Participación (+1)", value=f"{bal['points_participation']} pts", inline=True)
+        embed.add_field(name="🏆 Victorias (+3)", value=f"{bal['points_wins']} pts", inline=True)
+        embed.add_field(name="🎖️ Guía/Encargado (+5)", value=f"{bal['points_guide']} pts", inline=True)
+        embed.add_field(name="🔄 Ajustes / Cesiones", value=f"{bal['points_adjusted']:+d} pts", inline=True)
+        embed.add_field(name="🛍️ Canjeados en Premios", value=f"{bal['points_spent']} pts", inline=True)
+        embed.add_field(name="📊 Total Neto del Mes", value=f"{bal['earned']} pts", inline=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Canjear Puntos", style=discord.ButtonStyle.success, emoji="🛍️", custom_id="pts_redeem_btn")
+    async def redeem_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        await self.cog.open_redeem_menu(interaction)
+
+
+class PointsCommands(commands.Cog):
+    def __init__(self, bot: commands.Bot) -> None:
+        self.bot = bot
+        self.store = PointsStore()
+
+    async def cog_load(self) -> None:
+        self.bot.add_view(LeaderboardView(self, 0))
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        await self.sync_all_verified_members()
+
+    async def sync_all_verified_members(self) -> int:
+        merged_total = 0
+        for guild in self.bot.guilds:
+            verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+            if not verified_role:
+                continue
+            for member in guild.members:
+                if member.bot or verified_role not in member.roles:
+                    continue
+                habbo_nick = clean_raw_name(member.display_name)
+                if habbo_nick:
+                    merged_total += self.store.merge_provisional_to_discord(member.id, guild.id, habbo_nick)
+                    if not self.store.get_verified_by_discord(member.id):
+                        self.store.restore_verified_from_guild(member.id, guild.id, habbo_nick)
+        return merged_total
+
+    def resolve_verified_by_member(self, guild: discord.Guild, member: discord.Member):
+        verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+        if verified_role and verified_role in member.roles:
+            habbo_nick = clean_raw_name(member.display_name)
+            self.store.merge_provisional_to_discord(member.id, guild.id, habbo_nick)
+            restored = self.store.restore_verified_from_guild(member.id, guild.id, habbo_nick)
+            return dict(restored) if restored else None
+        row = self.store.get_verified_by_discord(member.id)
+        return dict(row) if row else None
+
+    def resolve_verified_member(self, guild: discord.Guild, habbo_name: str):
+        cleaned = clean_raw_name(habbo_name)
+        target = cleaned.casefold()
+        target_norm = normalize_habbo_key(cleaned)
+
+        if guild:
+            verified_role = discord.utils.get(guild.roles, name=VERIFIED_ROLE_NAME)
+            for member in guild.members:
+                if member.bot:
+                    continue
+                if verified_role and verified_role not in member.roles:
+                    continue
+                raw_candidates = [clean_raw_name(member.display_name), clean_raw_name(member.name)]
+                exact_candidates = {c.casefold() for c in raw_candidates if c}
+                norm_candidates = {normalize_habbo_key(c) for c in raw_candidates if normalize_habbo_key(c)}
+
+                if target in exact_candidates or (target_norm and target_norm in norm_candidates):
+                    official_name = clean_raw_name(member.display_name) or cleaned
+                    self.store.merge_provisional_to_discord(member.id, guild.id, official_name)
+                    restored = self.store.restore_verified_from_guild(member.id, guild.id, official_name)
+                    return dict(restored) if restored else None
+
+        row = self.store.get_verified_user(cleaned)
+        if row:
+            return dict(row)
+
+        return None
+
+    async def open_redeem_menu(self, interaction: discord.Interaction) -> None:
+        link = self.resolve_verified_by_member(interaction.guild, interaction.user)
+        if not link:
+            return await interaction.response.send_message(
+                "❌ No estás verificado en la base militar. Completa tu registro antes de canjear puntos.",
+                ephemeral=True,
+            )
+
+        bal = self.store.get_user_balance(int(link["discord_id"]))
+        available = bal["available"] if bal else 0
+        if available < 30:
+            return await interaction.response.send_message(
+                f"❌ **Saldo insuficiente:** Tienes **{available} pts** disponibles y el premio mínimo cuesta **30 pts** (1 Dígito Habbo).",
+                ephemeral=True,
+            )
+
+        catalog_lines = []
+        for key, item in REWARDS_CATALOG.items():
+            allowed, next_ts = self.store.check_reward_limit(int(link["discord_id"]), key)
+            status = "✅ Disponible" if allowed else f"⏳ Límite alcanzado (<t:{next_ts}:R>)"
+            catalog_lines.append(
+                f"{item['emoji']} **{item['name']}** — `{item['cost']} pts` · *{item['period']}* ({status})"
+            )
+
+        embed = discord.Embed(
+            title=f"🛍️ Catálogo Oficial de Canjes — {link['habbo_name']}",
+            description=(
+                f"💰 **Tu saldo disponible:** **{available} pts**\n"
+                f"Selecciona un premio en el menú desplegable inferior. Un rango alto (**{HIGH_RANK_ROLE_NAME}**) autorizará tu entrega.\n\n"
+                + "\n".join(catalog_lines)
+            ),
+            color=discord.Color.gold(),
+        )
+        view = RewardCatalogView(self, int(link["discord_id"]), link["habbo_name"], available)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    def find_activities_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
+        if ACTIVITIES_CHANNEL_ID and ACTIVITIES_CHANNEL_ID.isdigit():
+            ch = guild.get_channel(int(ACTIVITIES_CHANNEL_ID))
+            if isinstance(ch, discord.TextChannel):
+                return ch
+        for ch in guild.text_channels:
+            if ACTIVITIES_CHANNEL_NAME.lower() in ch.name.lower():
+                return ch
+        return None
+
+    def is_activities_channel(self, channel: discord.abc.GuildChannel) -> bool:
+        if not channel:
+            return False
+        if ACTIVITIES_CHANNEL_ID and ACTIVITIES_CHANNEL_ID.isdigit():
+            return channel.id == int(ACTIVITIES_CHANNEL_ID)
+        return ACTIVITIES_CHANNEL_NAME.lower() in getattr(channel, "name", "").lower()
+
+    def parse_activity_template(self, text: str):
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not lines:
+            return None
+
+        date_str = None
+        game_str = None
+        guide_str = None
+        section = None
+        raw_participants = []
+        raw_winners = []
+
+        for line in lines:
+            clean = clean_raw_name(line)
+            lower = clean.lower()
+
+            if "fecha:" in lower:
+                date_str = clean.split(":", 1)[1].strip()
+                section = None
+            elif "juego:" in lower:
+                game_str = clean.split(":", 1)[1].strip()
+                section = None
+            elif "encargado" in lower and ":" in lower:
+                guide_str = clean_raw_name(clean.split(":", 1)[1])
+                section = None
+            elif "participantes" in lower:
+                section = "participants"
+            elif "ganadores" in lower:
+                section = "winners"
+            elif section == "participants":
+                name = re.sub(r"^[\-\•\*\d\)\s]+", "", clean).strip()
+                name = re.sub(r"\s*\(.*?\)\s*\$", "", name).strip()
+                name = clean_raw_name(name)
+                if name:
+                    raw_participants.append(name)
+            elif section == "winners":
+                if ":" in clean:
+                    name = clean.split(":", 1)[1].strip()
+                else:
+                    name = re.sub(r"^[\-\•\*\d\)\s]+", "", clean).strip()
+                name = re.sub(r"\s*\(.*?\)\s*\$", "", name).strip()
+                name = clean_raw_name(name)
+                if name and name.lower() not in ("nadie", "ninguno", "-", "n/a"):
+                    raw_winners.append(name)
+
+        if not (date_str and game_str and guide_str and (raw_participants or raw_winners)):
+            return None
+
+        return {
+            "date": date_str,
+            "game": game_str,
+            "guide": guide_str,
+            "participants": raw_participants,
+            "winners": raw_winners,
+        }
+
+    def validate_and_extract_entries(self, guild: discord.Guild, parsed: dict):
+        unverified = []
+
+        guide_row = self.resolve_verified_member(guild, parsed["guide"])
+        if not guide_row:
+            unverified.append(f"Encargado(a): `{parsed['guide']}`")
+
+        seen_part = set()
+        valid_participants = []
+        for p_name in parsed["participants"]:
+            key = normalize_habbo_key(p_name) or p_name.casefold()
+            if key in seen_part:
+                continue
+            seen_part.add(key)
+            row = self.resolve_verified_member(guild, p_name)
+            if not row:
+                unverified.append(f"Participante: `{p_name}`")
+            else:
+                valid_participants.append(row)
+
+        valid_winners = []
+        for w_name in parsed["winners"]:
+            row = self.resolve_verified_member(guild, w_name)
+            if not row:
+                unverified.append(f"Ganador(a): `{w_name}`")
+            else:
+                valid_winners.append(row)
+
+        return guide_row, valid_participants, valid_winners, unverified
+
+    @commands.Cog.listener()
+    async def on_message(self, message: discord.Message) -> None:
+        if message.author.bot or not message.guild:
+            return
+        if not self.is_activities_channel(message.channel):
+            return
+        await self.process_activity_message(message)
+
+    @commands.Cog.listener()
+    async def on_message_edit(self, _before: discord.Message, after: discord.Message) -> None:
+        if after.author.bot or not after.guild:
+            return
+        if not self.is_activities_channel(after.channel):
+            return
+        await self.process_activity_message(after)
+
+    async def process_activity_message(self, message: discord.Message) -> None:
+        if self.store.is_activity_processed(message.id):
+            return
+
+        parsed = self.parse_activity_template(message.content)
+        if not parsed:
+            return
+
+        guide_row, valid_participants, valid_winners, unverified = self.validate_and_extract_entries(
+            message.guild, parsed
+        )
+
+        if unverified:
+            try:
+                await message.clear_reactions()
+                await message.add_reaction("⚠️")
+            except discord.HTTPException:
+                pass
+            error_list = "\n".join(f"• {item}" for item in dict.fromkeys(unverified))
+            await message.reply(
+                "⚠️ **Registro en pausa — Personal no verificado detectado**\n"
+                "Los siguientes nombres no coinciden con ningún oficial verificado en el servidor:\n"
+                f"{error_list}\n\n"
+                "*Edita tu mensaje corrigiendo la ortografía o pide al recluta que se verifique. El bot lo procesará automáticamente al editarlo.*",
+                delete_after=45,
+            )
+            return
+
+        summary = f"Guía: {guide_row['habbo_name']} | Part: {len(valid_participants)} | Rondas: {len(valid_winners)}"
+        self.store.record_activity(
+            message_id=message.id,
+            guild_id=message.guild.id,
+            guide=guide_row,
+            game_name=parsed["game"],
+            activity_date=parsed["date"],
+            participants=valid_participants,
+            winners=valid_winners,
+            summary_text=summary,
+        )
+
+        try:
+            await message.clear_reactions()
+            await message.add_reaction("✅")
+        except discord.HTTPException:
+            pass
+
+        await self.refresh_live_board(message.guild)
+
+    def build_leaderboard_embed(self, guild: discord.Guild, page: int = 0) -> discord.Embed:
+        ranking = self.store.get_leaderboard()
+        per_page = 15
+        total_pages = max(1, (len(ranking) - 1) // per_page + 1)
+        page = max(0, min(page, total_pages - 1))
+
+        embed = discord.Embed(
+            title="🏆 TABLERO OFICIAL DE PUNTOS — EJÉRCITO GFS",
+            description=(
+                "Clasificación mensual de mérito militar y saldo disponible para canje de premios y membresías.\n"
+                f"**Escala:** Participación `+{POINTS_PARTICIPANT} pt` · Ronda Ganada `+{POINTS_WINNER} pts` · Guía `+{POINTS_GUIDE} pts`"
+            ),
+            color=discord.Color.gold(),
+        )
+
+        if not ranking:
+            embed.add_field(
+                name="Sin registros en el ciclo actual",
+                value="Aún no se han contabilizado actividades este mes.",
+                inline=False,
+            )
+        else:
+            start = page * per_page
+            chunk = ranking[start : start + per_page]
+            lines = []
+            medals = {0: "🥇", 1: "🥈", 2: "🥉"}
+            for idx, entry in enumerate(chunk, start=start):
+                prefix = medals.get(idx, f"`#{idx + 1:02d}`")
+                lines.append(
+                    f"{prefix} **{entry['habbo_name']}** — **{entry['available']} pts** disp. *(Total: {entry['earned']})*"
+                )
+            embed.add_field(name=f"Clasificación General (Página {page + 1}/{total_pages})", value="\n".join(lines), inline=False)
+
+        embed.set_footer(text="Ejército GFS · Actualización automática en tiempo real")
+        return embed
+
+    async def refresh_live_board(self, guild: discord.Guild) -> None:
+        cfg = self.store.get_board_message(guild.id)
+        if not cfg:
+            return
+        channel = guild.get_channel(int(cfg["channel_id"]))
+        if not channel:
+            return
+        try:
+            msg = await channel.fetch_message(int(cfg["message_id"]))
+            embed = self.build_leaderboard_embed(guild, 0)
+            await msg.edit(embed=embed, view=LeaderboardView(self, 0))
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
+
+    @app_commands.command(
+        name="recalcular_historial",
+        description="Escanea los mensajes del canal de actividades y reconstruye los puntos perdidos (Solo Admins).",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def recalcular_historial(
+        self,
+        interaction: discord.Interaction,
+        solo_mes_actual: bool = True,
+        limite_mensajes: int = 500,
+    ) -> None:
+        await interaction.response.defer(ephemeral=True)
+        channel = self.find_activities_channel(interaction.guild)
+        if not channel:
+            return await interaction.followup.send(
+                "❌ No se encontró el canal de registro de actividades.", ephemeral=True
+            )
+
+        limite = max(10, min(limite_mensajes, 2000))
+        now = datetime.now(timezone.utc)
+        after_dt = datetime(now.year, now.month, 1, tzinfo=timezone.utc) if solo_mes_actual else None
+
+        recovered = 0
+        already_counted = 0
+        skipped_unverified = []
+
+        async for msg in channel.history(limit=limite, after=after_dt, oldest_first=True):
+            if msg.author.bot:
+                continue
+
+            if self.store.is_activity_processed(msg.id):
+                already_counted += 1
+                continue
+
+            parsed = self.parse_activity_template(msg.content)
+            if not parsed:
+                continue
+
+            guide_row, valid_participants, valid_winners, unverified = self.validate_and_extract_entries(
+                interaction.guild, parsed
+            )
+
+            if unverified:
+                skipped_unverified.append(f"• [Mensaje]({msg.jump_url}): {', '.join(dict.fromkeys(unverified))}")
+                continue
+
+            summary = f"Guía: {guide_row['habbo_name']} | Part: {len(valid_participants)} | Rondas: {len(valid_winners)}"
+            self.store.record_activity(
+                message_id=msg.id,
+                guild_id=interaction.guild.id,
+                guide=guide_row,
+                game_name=parsed["game"],
+                activity_date=parsed["date"],
+                participants=valid_participants,
+                winners=valid_winners,
+                summary_text=summary,
+            )
+
