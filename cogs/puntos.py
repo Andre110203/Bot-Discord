@@ -22,61 +22,70 @@ POINTS_GUIDE = 5
 REWARDS_CATALOG: dict[str, dict] = {
     "digito_1": {
         "name": "1 Dígito Habbo",
-        "cost": 30,
-        "period": "Semanal",
-        "cooldown_days": 7,
+        "cost": 60,
+        "period": "Mensual",
+        "max_per_period": 2,
+        "cooldown_days": 30,
         "emoji": "1️⃣",
-        "desc": "Dígito básico. Mínimo de puntos para canjear.",
+        "desc": "Dígito básico. Mínimo de puntos para canjear (Máx. 2/mes).",
     },
     "digitos_3": {
         "name": "3 Dígitos Habbo",
-        "cost": 80,
-        "period": "Semanal",
-        "cooldown_days": 7,
+        "cost": 120,
+        "period": "Mensual",
+        "max_per_period": 2,
+        "cooldown_days": 30,
         "emoji": "3️⃣",
-        "desc": "Paquete de 3 dígitos.",
+        "desc": "Paquete de 3 dígitos (Máx. 2/mes).",
     },
     "creditos_5": {
         "name": "5 Créditos Habbo",
-        "cost": 60,
-        "period": "Quincenal",
-        "cooldown_days": 15,
+        "cost": 80,
+        "period": "Mensual",
+        "max_per_period": 4,
+        "cooldown_days": 30,
         "emoji": "💰",
-        "desc": "Créditos para decorar o comprar en Habbo.",
+        "desc": "Créditos para decorar o comprar en Habbo (Máx. 4/mes).",
     },
     "creditos_15": {
         "name": "15 Créditos Habbo",
-        "cost": 150,
-        "period": "Quincenal",
-        "cooldown_days": 15,
+        "cost": 170,
+        "period": "Mensual",
+        "max_per_period": 4,
+        "cooldown_days": 30,
         "emoji": "💎",
-        "desc": "Paquete mayor de créditos Habbo.",
+        "desc": "Paquete mayor de créditos Habbo (Máx. 4/mes).",
     },
     "membresia_vip": {
         "name": "Membresía VIP",
-        "cost": 200,
+        "cost": 230,
         "period": "Mensual",
+        "max_per_period": 1,
         "cooldown_days": 30,
         "emoji": "👑",
-        "desc": "Premio exclusivo de membresía.",
+        "desc": "Premio exclusivo de membresía (Máx. 1/mes).",
     },
     "caja_hc": {
         "name": "Caja HC",
-        "cost": 300,
+        "cost": 320,
         "period": "Mensual",
+        "max_per_period": 1,
         "cooldown_days": 30,
         "emoji": "📦",
-        "desc": "Caja sorpresa HC de Habbo.",
+        "desc": "Caja sorpresa HC de Habbo (Máx. 1/mes).",
     },
     "membresia_titanium": {
         "name": "Membresía Titanium",
-        "cost": 350,
+        "cost": 380,
         "period": "Mensual",
+        "max_per_period": 1,
         "cooldown_days": 30,
         "emoji": "🛡️",
-        "desc": "Premio exclusivo de membresía.",
+        "desc": "Premio exclusivo de membresía (Máx. 1/mes).",
     },
 }
+
+MIN_REDEEM_COST = min(item["cost"] for item in REWARDS_CATALOG.values())
 
 HABBO_ALIASES: dict[str, str] = {
     "rubenandres09": "rubenandres",
@@ -436,23 +445,24 @@ class PointsStore:
             data["available"] = earned - data["points_spent"]
             return data
 
-    def check_reward_limit(self, discord_id: int, reward_key: str) -> tuple[bool, int]:
+    def check_reward_limit(self, discord_id: int, reward_key: str) -> tuple[bool, int, int, int]:
         reward = REWARDS_CATALOG[reward_key]
         cooldown_secs = reward["cooldown_days"] * 86400
+        max_allowed = reward["max_per_period"]
         now = int(time.time())
+        cutoff = now - cooldown_secs
         with self.database() as db:
-            row = db.execute(
+            rows = db.execute(
                 """SELECT created_at FROM redemptions_log
-                   WHERE discord_id=? AND membership_name=? COLLATE NOCASE
-                   ORDER BY created_at DESC LIMIT 1""",
-                (discord_id, reward["name"]),
-            ).fetchone()
-            if not row:
-                return True, 0
-            next_available = int(row["created_at"]) + cooldown_secs
-            if now < next_available:
-                return False, next_available
-            return True, 0
+                   WHERE discord_id=? AND membership_name=? COLLATE NOCASE AND created_at > ?
+                   ORDER BY created_at ASC""",
+                (discord_id, reward["name"], cutoff),
+            ).fetchall()
+            used_count = len(rows)
+            if used_count >= max_allowed:
+                next_available = int(rows[0]["created_at"]) + cooldown_secs
+                return False, next_available, used_count, max_allowed
+            return True, 0, used_count, max_allowed
 
     def transfer_points(
         self,
@@ -489,19 +499,21 @@ class PointsStore:
         reward = REWARDS_CATALOG[reward_key]
         cost = reward["cost"]
         cooldown_secs = reward["cooldown_days"] * 86400
+        max_allowed = reward["max_per_period"]
         now = int(time.time())
+        cutoff = now - cooldown_secs
 
         with self.database() as db:
             db.execute("BEGIN IMMEDIATE")
-            last = db.execute(
+            recent = db.execute(
                 """SELECT created_at FROM redemptions_log
-                   WHERE discord_id=? AND membership_name=? COLLATE NOCASE
-                   ORDER BY created_at DESC LIMIT 1""",
-                (discord_id, reward["name"]),
-            ).fetchone()
-            if last and now < int(last["created_at"]) + cooldown_secs:
-                next_ts = int(last["created_at"]) + cooldown_secs
-                return False, f"Límite {reward['period'].lower()} alcanzado. Disponible nuevamente <t:{next_ts}:R>."
+                   WHERE discord_id=? AND membership_name=? COLLATE NOCASE AND created_at > ?
+                   ORDER BY created_at ASC""",
+                (discord_id, reward["name"], cutoff),
+            ).fetchall()
+            if len(recent) >= max_allowed:
+                next_ts = int(recent[0]["created_at"]) + cooldown_secs
+                return False, f"Límite mensual alcanzado ({len(recent)}/{max_allowed}). Próximo cupo disponible <t:{next_ts}:R>."
 
             row = db.execute("SELECT * FROM military_points WHERE discord_id=? LIMIT 1", (discord_id,)).fetchone()
             if not row:
@@ -570,7 +582,7 @@ class RewardSelect(discord.ui.Select):
         for key, item in REWARDS_CATALOG.items():
             options.append(
                 discord.SelectOption(
-                    label=f"{item['name']} — {item['cost']} pts ({item['period']})",
+                    label=f"{item['name']} — {item['cost']} pts (Máx. {item['max_per_period']}/mes)",
                     value=key,
                     description=item["desc"][:100],
                     emoji=item["emoji"],
@@ -590,13 +602,13 @@ class RewardSelect(discord.ui.Select):
         reward_key = self.values[0]
         reward = REWARDS_CATALOG[reward_key]
 
-        allowed, next_ts = self.cog.store.check_reward_limit(self.requester_id, reward_key)
+        allowed, next_ts, used_count, max_allowed = self.cog.store.check_reward_limit(self.requester_id, reward_key)
         if not allowed:
             return await interaction.response.edit_message(
                 content=(
-                    f"⛔ **Límite de Canje Alcanzado ({reward['period']})**\n"
-                    f"Ya reclamaste **{reward['name']}** dentro de este periodo.\n"
-                    f"• **Próximo canje habilitado:** <t:{next_ts}:F> (<t:{next_ts}:R>)."
+                    f"⛔ **Límite Mensual de Canje Alcanzado ({used_count}/{max_allowed})**\n"
+                    f"Ya alcanzaste el tope mensual permitido para **{reward['name']}** (máximo **{max_allowed} por mes**).\n"
+                    f"• **Próximo cupo habilitado:** <t:{next_ts}:F> (<t:{next_ts}:R>)."
                 ),
                 embed=None,
                 view=None,
@@ -624,7 +636,7 @@ class RewardSelect(discord.ui.Select):
         )
         req_embed.add_field(name="Premio Solicitado", value=f"{reward['emoji']} **{reward['name']}**", inline=True)
         req_embed.add_field(name="Costo", value=f"**{reward['cost']} pts**", inline=True)
-        req_embed.add_field(name="Límite / Reclamación", value=f"**{reward['period']}**", inline=True)
+        req_embed.add_field(name="Cupo Mensual", value=f"**{used_count + 1}/{max_allowed} este mes**", inline=True)
         req_embed.add_field(name="Saldo Actual del Oficial", value=f"{disp} pts *(Quedarían {disp - reward['cost']} pts)*", inline=False)
         req_embed.set_footer(text="Ejército GFS · Control de Recompensas y Ascensos")
 
@@ -681,6 +693,7 @@ class RedemptionApprovalView(discord.ui.View):
         reward = REWARDS_CATALOG[self.reward_key]
         bal = self.cog.store.get_user_balance(self.requester_id)
         remaining = bal["available"] if bal else 0
+        _, _, used_now, max_allowed = self.cog.store.check_reward_limit(self.requester_id, self.reward_key)
 
         for child in self.children:
             child.disabled = True
@@ -696,7 +709,7 @@ class RedemptionApprovalView(discord.ui.View):
         )
         announce_embed.add_field(name="Premio Obtenido", value=f"{reward['emoji']} **{reward['name']}**", inline=True)
         announce_embed.add_field(name="Puntos Canjeados", value=f"`-{reward['cost']} pts`", inline=True)
-        announce_embed.add_field(name="Reclamación", value=reward["period"], inline=True)
+        announce_embed.add_field(name="Uso Mensual", value=f"{used_now}/{max_allowed} este mes", inline=True)
         announce_embed.add_field(name="Saldo Restante", value=f"**{remaining} pts**", inline=True)
         announce_embed.add_field(name="Autorizado por", value=interaction.user.mention, inline=True)
         announce_embed.set_footer(text="Ejército GFS · Tesorería y Mérito Militar")
@@ -850,18 +863,21 @@ class PointsCommands(commands.Cog):
 
         bal = self.store.get_user_balance(int(link["discord_id"]))
         available = bal["available"] if bal else 0
-        if available < 30:
+        if available < MIN_REDEEM_COST:
             return await interaction.response.send_message(
-                f"❌ **Saldo insuficiente:** Tienes **{available} pts** disponibles y el premio mínimo cuesta **30 pts** (1 Dígito Habbo).",
+                f"❌ **Saldo insuficiente:** Tienes **{available} pts** disponibles y el premio mínimo cuesta **{MIN_REDEEM_COST} pts** (1 Dígito Habbo).",
                 ephemeral=True,
             )
 
         catalog_lines = []
         for key, item in REWARDS_CATALOG.items():
-            allowed, next_ts = self.store.check_reward_limit(int(link["discord_id"]), key)
-            status = "✅ Disponible" if allowed else f"⏳ Límite alcanzado (<t:{next_ts}:R>)"
+            allowed, next_ts, used_count, max_allowed = self.store.check_reward_limit(int(link["discord_id"]), key)
+            if allowed:
+                status = f"✅ Disponible ({used_count}/{max_allowed} este mes)"
+            else:
+                status = f"⏳ Tope mensual {used_count}/{max_allowed} (<t:{next_ts}:R>)"
             catalog_lines.append(
-                f"{item['emoji']} **{item['name']}** — `{item['cost']} pts` · *{item['period']}* ({status})"
+                f"{item['emoji']} **{item['name']}** — `{item['cost']} pts` · *Máx. {max_allowed}/mes* ({status})"
             )
 
         embed = discord.Embed(
