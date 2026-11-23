@@ -292,4 +292,268 @@ class PointsStore:
 
     def create_provisional_user(self, habbo_name: str):
         cleaned = clean_raw_name(habbo_name)
-        prov_id
+        prov_id = -(abs(hash(cleaned.casefold())) % 900_000_000 + 100_000_000)
+        with self.database() as db:
+            db.execute(
+                """INSERT INTO verified_links (discord_id, guild_id, habbo_unique_id, habbo_name, verified_at)
+                   VALUES (?, 0, ?, ?, ?)
+                   ON CONFLICT(habbo_name) DO NOTHING""",
+                (prov_id, f"provisional-{cleaned.casefold()}", cleaned, int(time.time())),
+            )
+            return db.execute(
+                "SELECT * FROM verified_links WHERE habbo_name=? COLLATE NOCASE LIMIT 1",
+                (cleaned,),
+            ).fetchone()
+
+    def merge_provisional_to_discord(self, real_discord_id: int, guild_id: int, habbo_name: str) -> int:
+        cleaned = clean_raw_name(habbo_name)
+        target_norm = normalize_habbo_key(cleaned)
+        merged_count = 0
+        with self.database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            provs = db.execute("SELECT * FROM verified_links WHERE discord_id < 0").fetchall()
+            matching_provs = [
+                p for p in provs
+                if p["habbo_name"].casefold() == cleaned.casefold()
+                or (target_norm and normalize_habbo_key(p["habbo_name"]) == target_norm)
+            ]
+
+            for prov in matching_provs:
+                prov_id = int(prov["discord_id"])
+                prov_pts = db.execute(
+                    "SELECT * FROM military_points WHERE discord_id=? LIMIT 1",
+                    (prov_id,),
+                ).fetchone()
+
+                if prov_pts:
+                    self._upsert_points(
+                        db,
+                        real_discord_id,
+                        cleaned,
+                        part_pts=prov_pts["points_participation"],
+                        win_pts=prov_pts["points_wins"],
+                        guide_pts=prov_pts["points_guide"],
+                        adj_pts=prov_pts["points_adjusted"],
+                        spent_pts=prov_pts["points_spent"],
+                        now=int(time.time()),
+                    )
+                    db.execute("DELETE FROM military_points WHERE discord_id=?", (prov_id,))
+
+                db.execute("DELETE FROM verified_links WHERE discord_id=?", (prov_id,))
+                merged_count += 1
+
+            db.execute(
+                """INSERT INTO verified_links (discord_id, guild_id, habbo_unique_id, habbo_name, verified_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(discord_id) DO UPDATE SET habbo_name=excluded.habbo_name""",
+                (real_discord_id, guild_id, f"discord-sync-{real_discord_id}", cleaned, int(time.time())),
+            )
+        return merged_count
+
+    def get_verified_by_discord(self, discord_id: int):
+        with self.database() as db:
+            return db.execute(
+                "SELECT * FROM verified_links WHERE discord_id=? LIMIT 1",
+                (discord_id,),
+            ).fetchone()
+
+    def is_activity_processed(self, message_id: int) -> bool:
+        with self.database() as db:
+            row = db.execute(
+                "SELECT 1 FROM activity_logs WHERE message_id=? LIMIT 1",
+                (message_id,),
+            ).fetchone()
+            return bool(row)
+
+    def record_activity(
+        self,
+        message_id: int,
+        guild_id: int,
+        guide: dict,
+        game_name: str,
+        activity_date: str,
+        participants: list[dict],
+        winners: list[dict],
+        summary_text: str,
+    ) -> None:
+        now = int(time.time())
+        with self.database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            exists = db.execute("SELECT 1 FROM activity_logs WHERE message_id=?", (message_id,)).fetchone()
+            if exists:
+                return
+
+            self._upsert_points(db, guide["discord_id"], guide["habbo_name"], guide_pts=POINTS_GUIDE, now=now)
+
+            for p in participants:
+                self._upsert_points(db, p["discord_id"], p["habbo_name"], part_pts=POINTS_PARTICIPANT, now=now)
+
+            for w in winners:
+                self._upsert_points(db, w["discord_id"], w["habbo_name"], win_pts=POINTS_WINNER, now=now)
+
+            db.execute(
+                """INSERT INTO activity_logs
+                   (message_id, guild_id, guide_discord_id, guide_habbo, game_name, activity_date, summary_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (message_id, guild_id, guide["discord_id"], guide["habbo_name"], game_name, activity_date, summary_text, now),
+            )
+
+    def _upsert_points(
+        self,
+        db: sqlite3.Connection,
+        discord_id: int,
+        habbo_name: str,
+        part_pts: int = 0,
+        win_pts: int = 0,
+        guide_pts: int = 0,
+        adj_pts: int = 0,
+        spent_pts: int = 0,
+        now: int = 0,
+    ) -> None:
+        db.execute(
+            """INSERT INTO military_points
+               (discord_id, habbo_name, points_participation, points_wins, points_guide, points_adjusted, points_spent, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(discord_id) DO UPDATE SET
+                 habbo_name = excluded.habbo_name,
+                 points_participation = military_points.points_participation + excluded.points_participation,
+                 points_wins = military_points.points_wins + excluded.points_wins,
+                 points_guide = military_points.points_guide + excluded.points_guide,
+                 points_adjusted = military_points.points_adjusted + excluded.points_adjusted,
+                 points_spent = military_points.points_spent + excluded.points_spent,
+                 updated_at = excluded.updated_at""",
+            (discord_id, habbo_name, part_pts, win_pts, guide_pts, adj_pts, spent_pts, now or int(time.time())),
+        )
+
+    def get_user_balance(self, discord_id: int):
+        with self.database() as db:
+            row = db.execute("SELECT * FROM military_points WHERE discord_id=? LIMIT 1", (discord_id,)).fetchone()
+            if not row:
+                return None
+            data = dict(row)
+            earned = data["points_participation"] + data["points_wins"] + data["points_guide"] + data["points_adjusted"]
+            data["earned"] = earned
+            data["available"] = earned - data["points_spent"]
+            return data
+
+    def check_reward_limit(self, discord_id: int, reward_key: str) -> tuple[bool, int]:
+        reward = REWARDS_CATALOG[reward_key]
+        cooldown_secs = reward["cooldown_days"] * 86400
+        now = int(time.time())
+        with self.database() as db:
+            row = db.execute(
+                """SELECT created_at FROM redemptions_log
+                   WHERE discord_id=? AND membership_name=? COLLATE NOCASE
+                   ORDER BY created_at DESC LIMIT 1""",
+                (discord_id, reward["name"]),
+            ).fetchone()
+            if not row:
+                return True, 0
+            next_available = int(row["created_at"]) + cooldown_secs
+            if now < next_available:
+                return False, next_available
+            return True, 0
+
+    def transfer_points(
+        self,
+        sender_id: int,
+        sender_habbo: str,
+        receiver_id: int,
+        receiver_habbo: str,
+        amount: int,
+        reason: str,
+    ) -> bool:
+        now = int(time.time())
+        with self.database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT * FROM military_points WHERE discord_id=? LIMIT 1", (sender_id,)).fetchone()
+            if not row:
+                return False
+            earned = row["points_participation"] + row["points_wins"] + row["points_guide"] + row["points_adjusted"]
+            available = earned - row["points_spent"]
+            if available < amount:
+                return False
+
+            self._upsert_points(db, sender_id, sender_habbo, adj_pts=-amount, now=now)
+            self._upsert_points(db, receiver_id, receiver_habbo, adj_pts=amount, now=now)
+
+            db.execute(
+                """INSERT INTO transfers_log
+                   (sender_discord_id, sender_habbo, receiver_discord_id, receiver_habbo, amount, reason, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (sender_id, sender_habbo, receiver_id, receiver_habbo, amount, reason, now),
+            )
+            return True
+
+    def redeem_reward_atomic(self, discord_id: int, habbo_name: str, reward_key: str, admin_id: int) -> tuple[bool, str]:
+        reward = REWARDS_CATALOG[reward_key]
+        cost = reward["cost"]
+        cooldown_secs = reward["cooldown_days"] * 86400
+        now = int(time.time())
+
+        with self.database() as db:
+            db.execute("BEGIN IMMEDIATE")
+            last = db.execute(
+                """SELECT created_at FROM redemptions_log
+                   WHERE discord_id=? AND membership_name=? COLLATE NOCASE
+                   ORDER BY created_at DESC LIMIT 1""",
+                (discord_id, reward["name"]),
+            ).fetchone()
+            if last and now < int(last["created_at"]) + cooldown_secs:
+                next_ts = int(last["created_at"]) + cooldown_secs
+                return False, f"Límite {reward['period'].lower()} alcanzado. Disponible nuevamente <t:{next_ts}:R>."
+
+            row = db.execute("SELECT * FROM military_points WHERE discord_id=? LIMIT 1", (discord_id,)).fetchone()
+            if not row:
+                return False, "El usuario no tiene puntos acumulados."
+            earned = row["points_participation"] + row["points_wins"] + row["points_guide"] + row["points_adjusted"]
+            available = earned - row["points_spent"]
+            if available < cost:
+                return False, f"Saldo insuficiente (tiene **{available} pts**, requiere **{cost} pts**)."
+
+            self._upsert_points(db, discord_id, habbo_name, spent_pts=cost, now=now)
+            db.execute(
+                """INSERT INTO redemptions_log (discord_id, habbo_name, membership_name, cost, admin_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (discord_id, habbo_name, reward["name"], cost, admin_id, now),
+            )
+            return True, "OK"
+
+    def adjust_points(self, discord_id: int, habbo_name: str, amount: int) -> None:
+        with self.database() as db:
+            self._upsert_points(db, discord_id, habbo_name, adj_pts=amount, now=int(time.time()))
+
+    def get_leaderboard(self) -> list[dict]:
+        with self.database() as db:
+            rows = db.execute("SELECT * FROM military_points").fetchall()
+            result = []
+            for r in rows:
+                d = dict(r)
+                earned = d["points_participation"] + d["points_wins"] + d["points_guide"] + d["points_adjusted"]
+                available = earned - d["points_spent"]
+                if earned > 0 or available > 0:
+                    d["earned"] = earned
+                    d["available"] = available
+                    result.append(d)
+            result.sort(key=lambda x: (x["available"], x["earned"]), reverse=True)
+            return result
+
+    def save_board_message(self, guild_id: int, channel_id: int, message_id: int) -> None:
+        with self.database() as db:
+            db.execute(
+                """INSERT INTO board_config (guild_id, channel_id, message_id)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(guild_id) DO UPDATE SET
+                     channel_id=excluded.channel_id,
+                     message_id=excluded.message_id""",
+                (guild_id, channel_id, message_id),
+            )
+
+    def get_board_message(self, guild_id: int):
+        with self.database() as db:
+            return db.execute("SELECT * FROM board_config WHERE guild_id=? LIMIT 1", (guild_id,)).fetchone()
+
+    def reset_monthly_cycle(self) -> None:
+        with self.database() as db:
+            db.execute("DELETE FROM military_points")
+            db.execute("DELETE FROM activity_logs")
