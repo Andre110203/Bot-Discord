@@ -153,7 +153,7 @@ def clean_raw_name(text: str) -> str:
 
 def normalize_habbo_key(name: str) -> str:
     base = clean_raw_name(name).casefold()
-    stripped = re.sub(r"^[._\-:!@]+|[._\-:!@]+\$", "", base).strip()
+    stripped = re.sub(r"^[._\-:!@]+|[._\-:!@]+$", "", base).strip()
     if stripped in HABBO_ALIASES:
         return HABBO_ALIASES[stripped]
     if base in HABBO_ALIASES:
@@ -557,6 +557,8 @@ class PointsStore:
         with self.database() as db:
             db.execute("DELETE FROM military_points")
             db.execute("DELETE FROM activity_logs")
+
+
 class RewardSelect(discord.ui.Select):
     def __init__(self, cog, requester_id: int, habbo_name: str, available_pts: int) -> None:
         self.cog = cog
@@ -715,7 +717,7 @@ class RedemptionApprovalView(discord.ui.View):
             child.disabled = True
         await interaction.message.edit(view=self)
         await interaction.response.send_message(
-            f"❌ La solicitud de canje de **{reward['name']}** para <@{self.requester_id}> (**{self.habbo_name}) fue rechazada por {interaction.user.mention}."
+            f"❌ La solicitud de canje de **{reward['name']}** para <@{self.requester_id}> (**{self.habbo_name}**) fue rechazada por {interaction.user.mention}."
         )
 
 
@@ -751,7 +753,7 @@ class LeaderboardView(discord.ui.View):
         bal = self.cog.store.get_user_balance(int(link["discord_id"]))
         if not bal:
             return await interaction.response.send_message(
-                f"🎖️ **, aún no registras puntos en el ciclo mensual actual (**0 pts**).",
+                f"🎖️ **{link['habbo_name']}**, aún no registras puntos en el ciclo mensual actual (**0 pts**).",
                 ephemeral=True,
             )
         embed = discord.Embed(
@@ -922,7 +924,7 @@ class PointsCommands(commands.Cog):
                 section = "winners"
             elif section == "participants":
                 name = re.sub(r"^[\-\•\*\d\)\s]+", "", clean).strip()
-                name = re.sub(r"\s*\(.*?\)\s*\$", "", name).strip()
+                name = re.sub(r"\s*\(.*?\)\s*$", "", name).strip()
                 name = clean_raw_name(name)
                 if name:
                     raw_participants.append(name)
@@ -931,7 +933,7 @@ class PointsCommands(commands.Cog):
                     name = clean.split(":", 1)[1].strip()
                 else:
                     name = re.sub(r"^[\-\•\*\d\)\s]+", "", clean).strip()
-                name = re.sub(r"\s*\(.*?\)\s*\$", "", name).strip()
+                name = re.sub(r"\s*\(.*?\)\s*$", "", name).strip()
                 name = clean_raw_name(name)
                 if name and name.lower() not in ("nadie", "ninguno", "-", "n/a"):
                     raw_winners.append(name)
@@ -1148,4 +1150,211 @@ class PointsCommands(commands.Cog):
                 winners=valid_winners,
                 summary_text=summary,
             )
+            recovered += 1
 
+            has_check = any(str(r.emoji) == "✅" for r in msg.reactions)
+            if not has_check:
+                try:
+                    await msg.clear_reactions()
+                    await msg.add_reaction("✅")
+                except discord.HTTPException:
+                    pass
+
+        await self.refresh_live_board(interaction.guild)
+
+        report = [
+            "🔄 **Reconstrucción de Historial Completada**",
+            f"• **Canal escaneado:** {channel.mention}",
+            f"• **Actividades recuperadas y sumadas:** `{recovered}`",
+            f"• **Actividades ya registradas (omitidas):** `{already_counted}`",
+        ]
+        if skipped_unverified:
+            preview = "\n".join(skipped_unverified[:10])
+            report.append(f"\n⚠️ **Registros omitidos por personal no verificado ({len(skipped_unverified)}):**\n{preview}")
+
+        await interaction.followup.send("\n".join(report), ephemeral=True)
+
+    @app_commands.command(name="regalar_puntos", description="Cede o regala puntos de tu saldo disponible a otro oficial verificado.")
+    async def regalar_puntos(
+        self,
+        interaction: discord.Interaction,
+        destinatario_habbo: str,
+        cantidad: int,
+        motivo: str = "Cesión voluntaria de puntos",
+    ) -> None:
+        await interaction.response.defer()
+        if cantidad <= 0:
+            return await interaction.followup.send("❌ La cantidad a transferir debe ser mayor a **0 pts**.", ephemeral=True)
+
+        sender = self.resolve_verified_by_member(interaction.guild, interaction.user)
+        if not sender:
+            return await interaction.followup.send(
+                "❌ No estás verificado en la base militar. Completa tu registro primero.", ephemeral=True
+            )
+
+        receiver = self.resolve_verified_member(interaction.guild, destinatario_habbo)
+        if not receiver:
+            return await interaction.followup.send(
+                f"❌ El destinatario **{destinatario_habbo}** no figura como oficial verificado.", ephemeral=True
+            )
+
+        if int(sender["discord_id"]) == int(receiver["discord_id"]):
+            return await interaction.followup.send("❌ No puedes transferirte puntos a ti mismo.", ephemeral=True)
+
+        success = self.store.transfer_points(
+            sender_id=int(sender["discord_id"]),
+            sender_habbo=sender["habbo_name"],
+            receiver_id=int(receiver["discord_id"]),
+            receiver_habbo=receiver["habbo_name"],
+            amount=cantidad,
+            reason=motivo,
+        )
+        if not success:
+            bal = self.store.get_user_balance(int(sender["discord_id"]))
+            disp = bal["available"] if bal else 0
+            return await interaction.followup.send(
+                f"❌ No tienes saldo suficiente para realizar esta transferencia. Disponible actual: **{disp} pts**.",
+                ephemeral=True,
+            )
+
+        sender_bal = self.store.get_user_balance(int(sender["discord_id"]))
+        receiver_bal = self.store.get_user_balance(int(receiver["discord_id"]))
+
+        embed = discord.Embed(
+            title="🤝 Cesión Oficial de Puntos Registrada",
+            description=f"<@{sender['discord_id']}> ha transferido puntos de su saldo a <@{receiver['discord_id']}>.",
+            color=discord.Color.teal(),
+        )
+        embed.add_field(name="Emisor", value=f"**{sender['habbo_name']}**\n*(Saldo restante: {sender_bal['available']} pts)*", inline=True)
+        embed.add_field(name="Beneficiario", value=f"**{receiver['habbo_name']}**\n*(Nuevo saldo: {receiver_bal['available']} pts)*", inline=True)
+        embed.add_field(name="Monto Transferido", value=f"**{cantidad} pts**", inline=True)
+        embed.add_field(name="Motivo", value=motivo, inline=False)
+        embed.set_footer(text="Ejército GFS · Registro Transparente de Mérito")
+
+        await self.refresh_live_board(interaction.guild)
+        await interaction.followup.send(embed=embed)
+
+    @app_commands.command(name="vincular_oficial", description="Vincula manualmente un Discord con su nombre de Habbo (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def vincular_oficial(self, interaction: discord.Interaction, usuario_discord: discord.Member, habbo_usuario: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        clean_nick = clean_raw_name(habbo_usuario)
+        merged = self.store.merge_provisional_to_discord(usuario_discord.id, interaction.guild.id, clean_nick)
+        self.store.restore_verified_from_guild(usuario_discord.id, interaction.guild.id, clean_nick)
+        await self.refresh_live_board(interaction.guild)
+        await interaction.followup.send(
+            f"✅ Oficial {usuario_discord.mention} vinculado con **{clean_nick}** (cuentas provisionales fusionadas: `{merged}`).",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="fusionar_provisionales",
+        description="Sincroniza y fusiona puntos provisionales con los miembros verificados de Discord (Solo Admins).",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def fusionar_provisionales(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        merged = await self.sync_all_verified_members()
+        await self.refresh_live_board(interaction.guild)
+        await interaction.followup.send(
+            f"🔄 **Sincronización completada:** `{merged}` cuenta(s) provisional(es) vinculadas y fusionadas con Discord.",
+            ephemeral=True,
+        )
+
+    @app_commands.command(name="tablero_puntos", description="Publica el tablero dinámico de puntos en este canal (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def tablero_puntos(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)
+        embed = self.build_leaderboard_embed(interaction.guild, 0)
+        msg = await interaction.channel.send(embed=embed, view=LeaderboardView(self, 0))
+        self.store.save_board_message(interaction.guild.id, interaction.channel.id, msg.id)
+        await interaction.followup.send("✅ Tablero dinámico publicado y vinculado para actualización automática.", ephemeral=True)
+
+    @app_commands.command(
+        name="canjear_puntos",
+        description="Abre el catálogo interactivo para canjear tus puntos por dígitos, créditos, cajas o membresías.",
+    )
+    async def canjear_puntos(self, interaction: discord.Interaction) -> None:
+        await self.open_redeem_menu(interaction)
+
+    @app_commands.command(name="ajustar_puntos", description="Suma o resta puntos manualmente a un oficial verificado (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def ajustar_puntos(self, interaction: discord.Interaction, habbo_usuario: str, puntos: int, motivo: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        link = self.resolve_verified_member(interaction.guild, habbo_usuario)
+        if not link:
+            return await interaction.followup.send(f"❌ El usuario **{habbo_usuario}** no está verificado.", ephemeral=True)
+
+        habbo_oficial = link["habbo_name"]
+        self.store.adjust_points(int(link["discord_id"]), habbo_oficial, puntos)
+        bal = self.store.get_user_balance(int(link["discord_id"]))
+        await self.refresh_live_board(interaction.guild)
+        await interaction.followup.send(
+            f"✅ Ajuste aplicado a **{habbo_oficial}**: `{puntos:+d} pts`.\n"
+            f"• **Motivo:** {motivo}\n"
+            f"• **Nuevo saldo disponible:** **{bal['available']} pts**",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="importar_puntos",
+        description="Carga masiva de puntos desde una lista Usuario:Puntos (Solo Admins).",
+    )
+    @app_commands.checks.has_permissions(administrator=True)
+    async def importar_puntos(self, interaction: discord.Interaction, lista_puntos: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        entries = re.split(r"[\n,;]+", lista_puntos.strip())
+        loaded = 0
+        provisional_created = []
+        invalid = []
+
+        for raw in entries:
+            item = raw.strip()
+            if not item:
+                continue
+            m = re.match(r"^(.+?)\s*[:=\t]\s*(-?\d+)$", item) or re.match(r"^(\S+)\s+(-?\d+)$", item)
+            if not m:
+                invalid.append(f"`{item}`")
+                continue
+
+            habbo_name = clean_raw_name(m.group(1))
+            pts = int(m.group(2))
+            link = self.resolve_verified_member(interaction.guild, habbo_name)
+            if not link:
+                link = dict(self.store.create_provisional_user(habbo_name))
+                provisional_created.append(habbo_name)
+
+            self.store.adjust_points(int(link["discord_id"]), link["habbo_name"], pts)
+            loaded += 1
+
+        await self.refresh_live_board(interaction.guild)
+        msg = [f"✅ **Importación completada:** `{loaded}` oficiales cargados en el tablero."]
+        if provisional_created:
+            msg.append(
+                f"⏳ **Cargados como provisionales ({len(provisional_created)})** *(se vincularán solos cuando se verifiquen)*:\n"
+                + ", ".join(f"`{u}`" for u in provisional_created)
+            )
+        if invalid:
+            msg.append("⚠️ **Con error de formato:** " + ", ".join(invalid))
+        await interaction.followup.send("\n\n".join(msg), ephemeral=True)
+
+    @app_commands.command(name="reiniciar_ciclo_puntos", description="Reinicia los puntos del ciclo mensual a cero (Solo Admins).")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def reiniciar_ciclo_puntos(self, interaction: discord.Interaction, confirmar: str) -> None:
+        await interaction.response.defer(ephemeral=True)
+        if confirmar.strip().upper() != "CONFIRMAR":
+            return await interaction.followup.send(
+                "⚠️ Acción cancelada. Para reiniciar el ciclo mensual debes escribir exactamente `CONFIRMAR` en el parámetro.",
+                ephemeral=True,
+            )
+
+        self.store.reset_monthly_cycle()
+        await self.refresh_live_board(interaction.guild)
+        await interaction.followup.send(
+            "🔄 **Ciclo mensual de puntos reiniciado a 0.** Todos los registros anteriores han sido limpiados.",
+            ephemeral=True,
+        )
+
+
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(PointsCommands(bot))
