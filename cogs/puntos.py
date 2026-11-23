@@ -15,6 +15,13 @@ ACTIVITIES_CHANNEL_ID = os.getenv("ACTIVITIES_CHANNEL_ID", "").strip()
 VERIFIED_ROLE_NAME = os.getenv("VERIFIED_ROLE_NAME", "Verificado")
 HIGH_RANK_ROLE_NAME = os.getenv("HIGH_RANK_ROLE_NAME", "🏅 Gobierno 🏅")
 
+# Roles que otorgan Puntos Dobles (x2). Se pueden personalizar en Render con DOUBLE_POINTS_ROLES separado por comas.
+DOUBLE_POINTS_ROLES_RAW = os.getenv(
+    "DOUBLE_POINTS_ROLES",
+    "Membresía VIP, Membresía Titanium, Puntos Dobles, x2",
+)
+DOUBLE_POINTS_KEYWORDS = [r.strip().casefold() for r in DOUBLE_POINTS_ROLES_RAW.split(",") if r.strip()]
+
 POINTS_PARTICIPANT = 1
 POINTS_WINNER = 3
 POINTS_GUIDE = 5
@@ -179,6 +186,20 @@ def is_high_rank(member: discord.Member) -> bool:
         if role_cf == target or "gobierno" in role_cf:
             return True
     return False
+
+
+def get_member_multiplier(guild: discord.Guild | None, discord_id: int) -> int:
+    if not guild or discord_id <= 0:
+        return 1
+    member = guild.get_member(discord_id)
+    if not member:
+        return 1
+    for role in member.roles:
+        role_cf = role.name.casefold()
+        for kw in DOUBLE_POINTS_KEYWORDS:
+            if kw and kw in role_cf:
+                return 2
+    return 1
 
 
 class PointsStore:
@@ -384,27 +405,35 @@ class PointsStore:
         participants: list[dict],
         winners: list[dict],
         summary_text: str,
+        multipliers: dict[int, int] | None = None,
     ) -> None:
         now = int(time.time())
+        mults = multipliers or {}
         with self.database() as db:
             db.execute("BEGIN IMMEDIATE")
             exists = db.execute("SELECT 1 FROM activity_logs WHERE message_id=?", (message_id,)).fetchone()
             if exists:
                 return
 
-            self._upsert_points(db, guide["discord_id"], guide["habbo_name"], guide_pts=POINTS_GUIDE, now=now)
+            g_id = int(guide["discord_id"])
+            g_mult = mults.get(g_id, 1)
+            self._upsert_points(db, g_id, guide["habbo_name"], guide_pts=POINTS_GUIDE * g_mult, now=now)
 
             for p in participants:
-                self._upsert_points(db, p["discord_id"], p["habbo_name"], part_pts=POINTS_PARTICIPANT, now=now)
+                p_id = int(p["discord_id"])
+                p_mult = mults.get(p_id, 1)
+                self._upsert_points(db, p_id, p["habbo_name"], part_pts=POINTS_PARTICIPANT * p_mult, now=now)
 
             for w in winners:
-                self._upsert_points(db, w["discord_id"], w["habbo_name"], win_pts=POINTS_WINNER, now=now)
+                w_id = int(w["discord_id"])
+                w_mult = mults.get(w_id, 1)
+                self._upsert_points(db, w_id, w["habbo_name"], win_pts=POINTS_WINNER * w_mult, now=now)
 
             db.execute(
                 """INSERT INTO activity_logs
                    (message_id, guild_id, guide_discord_id, guide_habbo, game_name, activity_date, summary_json, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (message_id, guild_id, guide["discord_id"], guide["habbo_name"], game_name, activity_date, summary_text, now),
+                (message_id, guild_id, g_id, guide["habbo_name"], game_name, activity_date, summary_text, now),
             )
 
     def _upsert_points(
@@ -764,22 +793,25 @@ class LeaderboardView(discord.ui.View):
                 "❌ No estás verificado en la base militar. Completa tu registro primero.", ephemeral=True
             )
         bal = self.cog.store.get_user_balance(int(link["discord_id"]))
+        mult = get_member_multiplier(interaction.guild, int(link["discord_id"]))
         if not bal:
             return await interaction.response.send_message(
                 f"🎖️ **{link['habbo_name']}**, aún no registras puntos en el ciclo mensual actual (**0 pts**).",
                 ephemeral=True,
             )
         embed = discord.Embed(
-            title=f"💳 Estado de Cuenta Militar — {link['habbo_name']}",
+            title=f"💳 Estado de Cuenta Militar — {link['habbo_name']}" + (" ⚡ [x2 ACTIVO]" if mult == 2 else ""),
             color=discord.Color.gold(),
         )
         embed.add_field(name="💰 Puntos Disponibles (Canjeables)", value=f"**{bal['available']} pts**", inline=False)
-        embed.add_field(name="🎮 Participación (+1)", value=f"{bal['points_participation']} pts", inline=True)
-        embed.add_field(name="🏆 Victorias (+3)", value=f"{bal['points_wins']} pts", inline=True)
-        embed.add_field(name="🎖️ Guía/Encargado (+5)", value=f"{bal['points_guide']} pts", inline=True)
+        embed.add_field(name=f"🎮 Participación (+{POINTS_PARTICIPANT * mult})", value=f"{bal['points_participation']} pts", inline=True)
+        embed.add_field(name=f"🏆 Victorias (+{POINTS_WINNER * mult})", value=f"{bal['points_wins']} pts", inline=True)
+        embed.add_field(name=f"🎖️ Guía/Encargado (+{POINTS_GUIDE * mult})", value=f"{bal['points_guide']} pts", inline=True)
         embed.add_field(name="🔄 Ajustes / Cesiones", value=f"{bal['points_adjusted']:+d} pts", inline=True)
         embed.add_field(name="🛍️ Canjeados en Premios", value=f"{bal['points_spent']} pts", inline=True)
         embed.add_field(name="📊 Total Neto del Mes", value=f"{bal['earned']} pts", inline=True)
+        if mult == 2:
+            embed.set_footer(text="⚡ Tienes activo el multiplicador Puntos Dobles (x2) en todas tus actividades.")
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="Canjear Puntos", style=discord.ButtonStyle.success, emoji="🛍️", custom_id="pts_redeem_btn")
@@ -852,6 +884,28 @@ class PointsCommands(commands.Cog):
             return dict(row)
 
         return None
+
+    def compute_activity_multipliers(
+        self,
+        guild: discord.Guild,
+        guide_row: dict,
+        participants: list[dict],
+        winners: list[dict],
+    ) -> tuple[dict[int, int], list[str]]:
+        multipliers: dict[int, int] = {}
+        x2_names: list[str] = []
+        seen_x2: set[int] = set()
+
+        all_entries = [guide_row, *participants, *winners]
+        for entry in all_entries:
+            did = int(entry["discord_id"])
+            if did not in multipliers:
+                mult = get_member_multiplier(guild, did)
+                multipliers[did] = mult
+                if mult == 2 and did not in seen_x2:
+                    seen_x2.add(did)
+                    x2_names.append(entry["habbo_name"])
+        return multipliers, x2_names
 
     async def open_redeem_menu(self, interaction: discord.Interaction) -> None:
         link = self.resolve_verified_by_member(interaction.guild, interaction.user)
@@ -1039,7 +1093,12 @@ class PointsCommands(commands.Cog):
             )
             return
 
-        summary = f"Guía: {guide_row['habbo_name']} | Part: {len(valid_participants)} | Rondas: {len(valid_winners)}"
+        multipliers, x2_names = self.compute_activity_multipliers(
+            message.guild, guide_row, valid_participants, valid_winners
+        )
+        x2_tag = f" | x2: {', '.join(x2_names)}" if x2_names else ""
+        summary = f"Guía: {guide_row['habbo_name']} | Part: {len(valid_participants)} | Rondas: {len(valid_winners)}{x2_tag}"
+
         self.store.record_activity(
             message_id=message.id,
             guild_id=message.guild.id,
@@ -1049,11 +1108,14 @@ class PointsCommands(commands.Cog):
             participants=valid_participants,
             winners=valid_winners,
             summary_text=summary,
+            multipliers=multipliers,
         )
 
         try:
             await message.clear_reactions()
             await message.add_reaction("✅")
+            if x2_names:
+                await message.add_reaction("⚡")
         except discord.HTTPException:
             pass
 
@@ -1069,7 +1131,7 @@ class PointsCommands(commands.Cog):
             title="🏆 TABLERO OFICIAL DE PUNTOS — EJÉRCITO GFS",
             description=(
                 "Clasificación mensual de mérito militar y saldo disponible para canje de premios y membresías.\n"
-                f"**Escala:** Participación `+{POINTS_PARTICIPANT} pt` · Ronda Ganada `+{POINTS_WINNER} pts` · Guía `+{POINTS_GUIDE} pts`"
+                f"**Escala:** Participación `+{POINTS_PARTICIPANT} pt` · Ronda Ganada `+{POINTS_WINNER} pts` · Guía `+{POINTS_GUIDE} pts` *(⚡ Membresías VIP/Titanium: x2)*"
             ),
             color=discord.Color.gold(),
         )
@@ -1087,8 +1149,9 @@ class PointsCommands(commands.Cog):
             medals = {0: "🥇", 1: "🥈", 2: "🥉"}
             for idx, entry in enumerate(chunk, start=start):
                 prefix = medals.get(idx, f"`#{idx + 1:02d}`")
+                bolt = " ⚡" if get_member_multiplier(guild, int(entry["discord_id"])) == 2 else ""
                 lines.append(
-                    f"{prefix} **{entry['habbo_name']}** — **{entry['available']} pts** disp. *(Total: {entry['earned']})*"
+                    f"{prefix} **{entry['habbo_name']}**{bolt} — **{entry['available']} pts** disp. *(Total: {entry['earned']})*"
                 )
             embed.add_field(name=f"Clasificación General (Página {page + 1}/{total_pages})", value="\n".join(lines), inline=False)
 
@@ -1155,7 +1218,12 @@ class PointsCommands(commands.Cog):
                 skipped_unverified.append(f"• [Mensaje]({msg.jump_url}): {', '.join(dict.fromkeys(unverified))}")
                 continue
 
-            summary = f"Guía: {guide_row['habbo_name']} | Part: {len(valid_participants)} | Rondas: {len(valid_winners)}"
+            multipliers, x2_names = self.compute_activity_multipliers(
+                interaction.guild, guide_row, valid_participants, valid_winners
+            )
+            x2_tag = f" | x2: {', '.join(x2_names)}" if x2_names else ""
+            summary = f"Guía: {guide_row['habbo_name']} | Part: {len(valid_participants)} | Rondas: {len(valid_winners)}{x2_tag}"
+
             self.store.record_activity(
                 message_id=msg.id,
                 guild_id=interaction.guild.id,
@@ -1165,6 +1233,7 @@ class PointsCommands(commands.Cog):
                 participants=valid_participants,
                 winners=valid_winners,
                 summary_text=summary,
+                multipliers=multipliers,
             )
             recovered += 1
 
@@ -1173,6 +1242,8 @@ class PointsCommands(commands.Cog):
                 try:
                     await msg.clear_reactions()
                     await msg.add_reaction("✅")
+                    if x2_names:
+                        await msg.add_reaction("⚡")
                 except discord.HTTPException:
                     pass
 
