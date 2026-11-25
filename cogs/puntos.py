@@ -12,6 +12,7 @@ from discord.ext import commands
 
 ACTIVITIES_CHANNEL_NAME = os.getenv("ACTIVITIES_CHANNEL_NAME", "registro-actividades")
 ACTIVITIES_CHANNEL_ID = os.getenv("ACTIVITIES_CHANNEL_ID", "").strip()
+TRANSACTIONS_CHANNEL_ID = int(os.getenv("TRANSACTIONS_CHANNEL_ID", "1575251539361140826").strip() or "1575251539361140826")
 VERIFIED_ROLE_NAME = os.getenv("VERIFIED_ROLE_NAME", "Verificado")
 HIGH_RANK_ROLE_NAME = os.getenv("HIGH_RANK_ROLE_NAME", "🏅 Gobierno 🏅")
 
@@ -600,6 +601,36 @@ class PointsStore:
             db.execute("DELETE FROM activity_logs")
 
 
+async def send_transaction_log(guild: discord.Guild | None, embed: discord.Embed) -> bool:
+    if not guild or TRANSACTIONS_CHANNEL_ID <= 0:
+        return False
+    channel = guild.get_channel(TRANSACTIONS_CHANNEL_ID)
+    if not isinstance(channel, discord.TextChannel):
+        try:
+            fetched = await guild.fetch_channel(TRANSACTIONS_CHANNEL_ID)
+            if isinstance(fetched, discord.TextChannel):
+                channel = fetched
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return False
+    if isinstance(channel, discord.TextChannel):
+        try:
+            await channel.send(embed=embed)
+            return True
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+    return False
+
+
+async def delete_request_message(message: discord.Message | None) -> bool:
+    if not message:
+        return False
+    try:
+        await message.delete()
+        return True
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return False
+
+
 class RewardSelect(discord.ui.Select):
     def __init__(self, cog, requester_id: int, habbo_name: str, available_pts: int) -> None:
         self.cog = cog
@@ -662,6 +693,7 @@ class RewardSelect(discord.ui.Select):
                 f"*Requiere aprobación de **{HIGH_RANK_ROLE_NAME}** o Administración.*"
             ),
             color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
         )
         req_embed.add_field(name="Premio Solicitado", value=f"{reward['emoji']} **{reward['name']}**", inline=True)
         req_embed.add_field(name="Costo", value=f"**{reward['cost']} pts**", inline=True)
@@ -698,7 +730,12 @@ class RedemptionApprovalView(discord.ui.View):
         self.habbo_name = habbo_name
         self.reward_key = reward_key
 
-    @discord.ui.button(label="Autorizar Canje", style=discord.ButtonStyle.success, emoji="✅")
+    @discord.ui.button(
+        label="Autorizar Canje",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+        custom_id="gfs_redeem_approve",
+    )
     async def approve_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         if not is_high_rank(interaction.user):
             return await interaction.response.send_message(
@@ -714,9 +751,6 @@ class RedemptionApprovalView(discord.ui.View):
         )
 
         if not success:
-            for child in self.children:
-                child.disabled = True
-            await interaction.message.edit(view=self)
             return await interaction.response.send_message(f"⚠️ No se pudo completar el canje: {reason}", ephemeral=True)
 
         reward = REWARDS_CATALOG[self.reward_key]
@@ -724,29 +758,36 @@ class RedemptionApprovalView(discord.ui.View):
         remaining = bal["available"] if bal else 0
         _, _, used_now, max_allowed = self.cog.store.check_reward_limit(self.requester_id, self.reward_key)
 
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
-
-        announce_embed = discord.Embed(
-            title="🎉 CANJE OFICIAL AUTORIZADO — EJÉRCITO GFS",
+        tx_embed = discord.Embed(
+            title="🎉 CANJE OFICIAL AUTORIZADO — HISTORIAL DE TRANSACCIONES",
             description=(
-                f"El oficial <@{self.requester_id}> (**{self.habbo_name}**) ha canjeado sus puntos exitosamente "
+                f"El oficial <@{self.requester_id}> (**{self.habbo_name}**) canjeó puntos exitosamente "
                 f"y fue autorizado por {interaction.user.mention}."
             ),
             color=discord.Color.green(),
+            timestamp=datetime.now(timezone.utc),
         )
-        announce_embed.add_field(name="Premio Obtenido", value=f"{reward['emoji']} **{reward['name']}**", inline=True)
-        announce_embed.add_field(name="Puntos Canjeados", value=f"`-{reward['cost']} pts`", inline=True)
-        announce_embed.add_field(name="Uso Mensual", value=f"{used_now}/{max_allowed} este mes", inline=True)
-        announce_embed.add_field(name="Saldo Restante", value=f"**{remaining} pts**", inline=True)
-        announce_embed.add_field(name="Autorizado por", value=interaction.user.mention, inline=True)
-        announce_embed.set_footer(text="Ejército GFS · Tesorería y Mérito Militar")
+        tx_embed.add_field(name="Premio Obtenido", value=f"{reward['emoji']} **{reward['name']}**", inline=True)
+        tx_embed.add_field(name="Puntos Descontados", value=f"`-{reward['cost']} pts`", inline=True)
+        tx_embed.add_field(name="Uso Mensual", value=f"{used_now}/{max_allowed} este mes", inline=True)
+        tx_embed.add_field(name="Saldo Restante", value=f"**{remaining} pts**", inline=True)
+        tx_embed.add_field(name="Autorizado por", value=interaction.user.mention, inline=True)
+        tx_embed.set_footer(text="Ejército GFS · Tesorería y Historial de Transacciones")
 
+        await send_transaction_log(interaction.guild, tx_embed)
         await self.cog.refresh_live_board(interaction.guild)
-        await interaction.response.send_message(embed=announce_embed)
+        await interaction.response.send_message(
+            f"✅ Canje de **{reward['name']}** para **{self.habbo_name}** autorizado y enviado al canal de transacciones.",
+            ephemeral=True,
+        )
+        await delete_request_message(interaction.message)
 
-    @discord.ui.button(label="Rechazar", style=discord.ButtonStyle.danger, emoji="❌")
+    @discord.ui.button(
+        label="Rechazar",
+        style=discord.ButtonStyle.danger,
+        emoji="❌",
+        custom_id="gfs_redeem_reject",
+    )
     async def reject_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
         if not is_high_rank(interaction.user):
             return await interaction.response.send_message(
@@ -755,12 +796,30 @@ class RedemptionApprovalView(discord.ui.View):
             )
 
         reward = REWARDS_CATALOG[self.reward_key]
-        for child in self.children:
-            child.disabled = True
-        await interaction.message.edit(view=self)
-        await interaction.response.send_message(
-            f"❌ La solicitud de canje de **{reward['name']}** para <@{self.requester_id}> (**{self.habbo_name}**) fue rechazada por {interaction.user.mention}."
+        bal = self.cog.store.get_user_balance(self.requester_id)
+        current_pts = bal["available"] if bal else 0
+
+        tx_embed = discord.Embed(
+            title="❌ SOLICITUD DE CANJE RECHAZADA — HISTORIAL DE TRANSACCIONES",
+            description=(
+                f"La solicitud de canje de <@{self.requester_id}> (**{self.habbo_name}**) fue rechazada "
+                f"por {interaction.user.mention}. No se descontaron puntos."
+            ),
+            color=discord.Color.red(),
+            timestamp=datetime.now(timezone.utc),
         )
+        tx_embed.add_field(name="Premio Solicitado", value=f"{reward['emoji']} **{reward['name']}**", inline=True)
+        tx_embed.add_field(name="Costo Requerido", value=f"`{reward['cost']} pts`", inline=True)
+        tx_embed.add_field(name="Saldo Actual del Oficial", value=f"**{current_pts} pts**", inline=True)
+        tx_embed.add_field(name="Rechazado por", value=interaction.user.mention, inline=True)
+        tx_embed.set_footer(text="Ejército GFS · Tesorería y Historial de Transacciones")
+
+        await send_transaction_log(interaction.guild, tx_embed)
+        await interaction.response.send_message(
+            f"❌ Solicitud de **{reward['name']}** para **{self.habbo_name}** rechazada y registrada en transacciones.",
+            ephemeral=True,
+        )
+        await delete_request_message(interaction.message)
 
 
 class LeaderboardView(discord.ui.View):
